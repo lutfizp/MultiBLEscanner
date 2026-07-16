@@ -1,0 +1,65 @@
+# Keep repository documentation in Git, except historical requirement phases
+*.md
+!/README.md
+!/CHANGELOG.md
+!/docs/*.md
+
+# Historical requirement documents remain local
+/docs/phase-1-requirement-analysis.md
+/docs/phase-2-technical-design.md
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+firmware/include/config.h
+
+# Runtime state and databases
+.bluetooth_scanner.run.lock
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Firmware and build output
+firmware/.pio/
+.pio/
+dist/
+build/
+
+# JavaScript tooling
+node_modules/
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local inspection artifacts
+image copy.png

@@ -1,0 +1,2302 @@
+from __future__ import annotations
+
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .bluetooth_ad import parse_advertising_and_scan_response
+from .config import Settings
+from .device_intelligence import analyze_manufacturer_data, infer_device_category
+from .correlation import (
+    akiyama_pair_cost,
+    alpha_from_p90_overlap,
+    assign_akiyama_pairs,
+    extract_approved_tokens,
+    parse_token_rules,
+    rssi_regression_difference,
+)
+from .models import (
+    DeviceEnrichment,
+    DeviceEvent,
+    DeviceIdentityCorrelation,
+    DeviceLocationEstimate,
+    LogicalDevice,
+    ManualDeviceCorrelationDecision,
+    Observation,
+    ObservedIdentity,
+    ProcessingError,
+    Scanner,
+    ScannerConfiguration,
+    ScannerHeartbeat,
+    SystemSetting,
+)
+from .processing import (
+    JOURNAL_PATH_LOSS_EXPONENT,
+    JOURNAL_REFERENCE_RSSI_DBM,
+    JOURNAL_VALIDATED_DISTANCE_M,
+    MovementResult,
+    ProcessingSettings,
+    RSSIWindowMetrics,
+    ensure_utc,
+    evaluate_presence_status,
+    identity_fingerprint,
+    identity_signature,
+    infer_proximity_from_rssi,
+    is_randomized_address,
+    is_synthetic_address_pattern,
+    normalize_address,
+    observed_again_status,
+    proximity_band,
+    rssi_window_metrics,
+    utcnow,
+)
+from .schemas import (
+    BLEObservationIn,
+    HeartbeatIn,
+    ManualCorrelationIn,
+    ObservationBatchIn,
+    ScannerPatchIn,
+    ScannerRegistrationIn,
+    SettingsPatchIn,
+)
+from .security import generate_scanner_token, hash_scanner_token, verify_scanner_token
+
+
+DEFAULT_SETTINGS: dict[str, tuple[Any, str]] = {
+    "presence_missing_seconds": (45, "Seconds without observation before a device becomes temporarily missing."),
+    "presence_offline_seconds": (180, "Seconds without observation before a device becomes offline."),
+    "heartbeat_timeout_seconds": (90, "Seconds without heartbeat before a scanner is marked offline."),
+    "raw_observation_retention_days": (30, "Raw observation retention window."),
+    "summary_retention_days": (365, "Summary and event retention window."),
+    "correlation_rotation_window_seconds": (
+        20,
+        "Maximum address handover interval for RSSI-time assignment. Calibrate this to scanner cadence; it is not an identity guarantee.",
+    ),
+    "correlation_evaluation_window_seconds": (
+        20,
+        "RSSI interval after a new address begins. At least the configured number of trusted samples is required for a statistical proposal.",
+    ),
+    "correlation_min_regression_samples": (
+        3,
+        "Minimum trusted observations in both RSSI regression windows. Fewer samples produce no statistical proposal.",
+    ),
+    "correlation_alpha": (
+        None,
+        "Optional calibrated Akiyama RSSI-time scale. When empty, the service records a per-run 90th-percentile width match; it does not auto-merge devices.",
+    ),
+    "correlation_unmatched_cost_seconds": (
+        30.0,
+        "Cost of leaving an address unmatched in the global RSSI-time assignment. This prevents forced candidate links.",
+    ),
+    "correlation_auto_accept_statistical": (
+        False,
+        "Disabled by default. Statistical RSSI-time assignments remain reviewable proposals until a validated site policy explicitly enables acceptance.",
+    ),
+    "correlation_statistical_max_cost": (
+        None,
+        "Required together with explicit auto-accept before a statistical proposal can move a logical device record.",
+    ),
+    "correlation_token_carryover_max_seconds": (
+        3600,
+        "Maximum interval for an approved static AD token to carry a logical device across a random-address change.",
+    ),
+    "correlation_token_min_observations": (
+        2,
+        "Minimum raw observations that must contain an approved token before it may carry an identity across an address change.",
+    ),
+    "correlation_token_rules": (
+        [],
+        "Operator-approved protocol token rules only. Each rule needs rule_id, ad_type, offset_bytes, length_bytes (at least 5 bytes), plus company_id or service_uuid scope.",
+    ),
+}
+
+
+TRUSTED_CLOCK_SYNC_MAX_AGE_MS = 5 * 60 * 1000
+MAX_FUTURE_OBSERVATION_SKEW = timedelta(minutes=5)
+LEGACY_SIGNAL_SETTING_KEYS = {"movement_rssi_delta", "rssi_smoothing_alpha"}
+
+
+def make_scanner_id() -> str:
+    return f"scn_{secrets.token_hex(6)}"
+
+
+def latest_datetime(first: datetime | None, second: datetime) -> datetime:
+    if first is None:
+        return ensure_utc(second)
+    normalized_first = ensure_utc(first)
+    normalized_second = ensure_utc(second)
+    return normalized_first if normalized_first >= normalized_second else normalized_second
+
+
+def rssi_samples_for_window_metric(
+    db: Session,
+    logical_device_id: str,
+    current_scanner_id: str,
+    current_rssi: int,
+) -> dict[str, list[float]]:
+    """Return chronological RSSI samples grouped by scanner for the paper metric."""
+    rows = db.execute(
+        select(Observation.scanner_id, Observation.rssi, Observation.observed_at, Observation.id)
+        .where(Observation.logical_device_id == logical_device_id)
+        .order_by(desc(Observation.observed_at), desc(Observation.id))
+        .limit(200)
+    ).all()
+    grouped: dict[str, list[float]] = {}
+    for scanner_id, rssi, _observed_at, _observation_id in reversed(rows):
+        grouped.setdefault(scanner_id, []).append(float(rssi))
+    grouped.setdefault(current_scanner_id, []).append(float(current_rssi))
+    return grouped
+
+
+def processing_settings_from_config(config: ScannerConfiguration | None, settings: Settings | None = None) -> ProcessingSettings:
+    if config is None:
+        if settings is None:
+            return ProcessingSettings()
+        return ProcessingSettings(
+            presence_missing_seconds=settings.presence_missing_seconds,
+            presence_offline_seconds=settings.presence_offline_seconds,
+        )
+    return ProcessingSettings(
+        presence_missing_seconds=config.presence_missing_seconds,
+        presence_offline_seconds=config.presence_offline_seconds,
+    )
+
+
+def scanner_config_payload(config: ScannerConfiguration) -> dict[str, Any]:
+    return {
+        "version": config.version,
+        "scan_interval_ms": config.scan_interval_ms,
+        "upload_interval_seconds": config.upload_interval_seconds,
+        "batch_size": config.batch_size,
+        "rssi_min": config.rssi_min,
+        "presence_missing_seconds": config.presence_missing_seconds,
+        "presence_offline_seconds": config.presence_offline_seconds,
+        "extra": config.extra or {},
+    }
+
+
+def proximity_model_payload(
+    proximity: Any,
+    raw_rssi: int | float,
+    smoothed_rssi: float,
+    metrics: RSSIWindowMetrics,
+) -> dict[str, Any]:
+    return {
+        "method": proximity.method,
+        "sequence_method": metrics.method,
+        "band": proximity.band,
+        "estimated_distance_m": proximity.distance_m,
+        "distance_range_m": list(proximity.distance_range_m) if proximity.distance_range_m else None,
+        "confidence": proximity.confidence,
+        "band_probabilities": proximity.probabilities,
+        "raw_rssi": raw_rssi,
+        "smoothed_rssi": smoothed_rssi,
+        "distance_available": proximity.distance_m is not None,
+        "distance_model": "log_distance_path_loss",
+        "distance_model_reference_rssi_dbm": JOURNAL_REFERENCE_RSSI_DBM,
+        "distance_model_path_loss_exponent": JOURNAL_PATH_LOSS_EXPONENT,
+        "distance_model_validated_distance_m": JOURNAL_VALIDATED_DISTANCE_M,
+        "distance_model_status": (
+            "within_published_esp32_baseline_range"
+            if proximity.distance_m is not None and proximity.distance_m <= JOURNAL_VALIDATED_DISTANCE_M
+            else "outside_published_baseline_range"
+            if proximity.distance_m is not None
+            else "unavailable"
+        ),
+        "confidence_basis": "paper_rssi_window_reliability" if metrics.window_ready else "rssi_window_not_ready",
+        "window_size": metrics.window_size,
+        "window_ready": metrics.window_ready,
+        "observed_anchor_count": metrics.observed_anchor_count,
+        "anchor_count": metrics.anchor_count,
+        "current_window_means": metrics.current_window_means,
+        "previous_window_means": metrics.previous_window_means,
+        "absolute_changes_db": metrics.absolute_changes_db,
+        "anchor_weights": metrics.weights,
+        "weighted_mean_change_db": metrics.weighted_mean_change_db,
+        "rssi_metric": metrics.rssi_metric,
+        "signal_reliability": metrics.reliability,
+        "movement_threshold": metrics.movement_threshold,
+    }
+
+
+def ensure_default_settings(db: Session) -> None:
+    for key in LEGACY_SIGNAL_SETTING_KEYS:
+        legacy = db.get(SystemSetting, key)
+        if legacy is not None:
+            db.delete(legacy)
+    for key, (value, description) in DEFAULT_SETTINGS.items():
+        existing = db.get(SystemSetting, key)
+        if existing is None:
+            db.add(SystemSetting(key=key, value=value, description=description))
+    db.commit()
+
+
+def register_scanner(db: Session, payload: ScannerRegistrationIn, settings: Settings) -> tuple[Scanner, str, ScannerConfiguration]:
+    existing = db.execute(select(Scanner).where(Scanner.hardware_id == payload.hardware_id)).scalar_one_or_none()
+    if existing is not None:
+        token = generate_scanner_token()
+        existing.token_hash = hash_scanner_token(token, settings.scanner_token_salt)
+        existing.status = "registered"
+        existing.enabled = True
+        existing.firmware_version = payload.firmware_version or existing.firmware_version
+        existing.hardware_version = payload.hardware_version or existing.hardware_version
+        config = db.execute(select(ScannerConfiguration).where(ScannerConfiguration.scanner_id == existing.id)).scalar_one()
+        db.commit()
+        return existing, token, config
+
+    token = generate_scanner_token()
+    scanner = Scanner(
+        id=make_scanner_id(),
+        display_name=payload.display_name or payload.hardware_id,
+        hardware_id=payload.hardware_id,
+        token_hash=hash_scanner_token(token, settings.scanner_token_salt),
+        installation_name=payload.installation_name,
+        firmware_version=payload.firmware_version,
+        hardware_version=payload.hardware_version,
+        status="registered",
+    )
+    db.add(scanner)
+    db.flush()
+
+    config = ScannerConfiguration(scanner_id=scanner.id)
+    db.add(config)
+    db.commit()
+    db.refresh(scanner)
+    db.refresh(config)
+    return scanner, token, config
+
+
+def authenticate_scanner(db: Session, scanner_id: str, token: str, settings: Settings) -> Scanner | None:
+    scanner = db.get(Scanner, scanner_id)
+    if scanner is None or not scanner.enabled:
+        return None
+    if not verify_scanner_token(token, scanner.token_hash, settings.scanner_token_salt):
+        return None
+    return scanner
+
+
+def get_scanner_config(db: Session, scanner_id: str) -> ScannerConfiguration:
+    config = db.execute(select(ScannerConfiguration).where(ScannerConfiguration.scanner_id == scanner_id)).scalar_one_or_none()
+    if config is None:
+        config = ScannerConfiguration(scanner_id=scanner_id)
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+    return config
+
+
+def record_heartbeat(db: Session, scanner: Scanner, payload: HeartbeatIn) -> dict[str, Any]:
+    now = utcnow()
+    existing = db.execute(
+        select(ScannerHeartbeat).where(
+            ScannerHeartbeat.scanner_id == scanner.id,
+            ScannerHeartbeat.message_id == payload.message_id,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return {"accepted": False, "duplicate": True}
+
+    heartbeat = ScannerHeartbeat(
+        scanner_id=scanner.id,
+        message_id=payload.message_id,
+        scanner_time=ensure_utc(payload.scanner_time, now) if payload.scanner_time else None,
+        uptime_seconds=payload.uptime_seconds,
+        firmware_version=payload.firmware_version,
+        network_state=payload.network_state,
+        health=payload.health,
+        buffer_usage=payload.buffer_usage,
+        pending_observations=payload.pending_observations,
+        dropped_observations=payload.dropped_observations,
+        config_version=payload.config_version,
+        config_status=payload.config_status,
+    )
+    db.add(heartbeat)
+
+    previous_status = scanner.status
+    scanner.status = "online"
+    scanner.last_heartbeat_at = now
+    scanner.last_seen_at = now
+    scanner.last_connection_at = scanner.last_connection_at or now
+    scanner.uptime_seconds = payload.uptime_seconds
+    scanner.firmware_version = payload.firmware_version or scanner.firmware_version
+    scanner.network_info = payload.network_state
+    if payload.config_version is not None:
+        scanner.config_version = payload.config_version
+
+    if previous_status != "online":
+        create_event(
+            db,
+            event_type="scanner_connected",
+            scanner_id=scanner.id,
+            occurred_at=now,
+            previous_state=previous_status,
+            new_state="online",
+            confidence=1.0,
+            reason="heartbeat_received",
+            dedupe_key=f"scanner-connected:{scanner.id}:{now.strftime('%Y%m%d%H%M')}",
+        )
+
+    db.commit()
+    return {"accepted": True, "duplicate": False}
+
+
+def create_event(
+    db: Session,
+    event_type: str,
+    occurred_at: datetime,
+    scanner_id: str | None = None,
+    logical_device_id: str | None = None,
+    observed_identity_id: str | None = None,
+    previous_state: str | None = None,
+    new_state: str | None = None,
+    previous_location: str | None = None,
+    new_location: str | None = None,
+    confidence: float = 0.0,
+    reason: str | None = None,
+    details: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
+    severity: str = "info",
+) -> DeviceEvent | None:
+    if dedupe_key:
+        for pending in db.new:
+            if isinstance(pending, DeviceEvent) and pending.dedupe_key == dedupe_key:
+                return None
+        existing = db.execute(select(DeviceEvent).where(DeviceEvent.dedupe_key == dedupe_key)).scalar_one_or_none()
+        if existing is not None:
+            return None
+    event = DeviceEvent(
+        event_type=event_type,
+        severity=severity,
+        scanner_id=scanner_id,
+        logical_device_id=logical_device_id,
+        observed_identity_id=observed_identity_id,
+        occurred_at=ensure_utc(occurred_at),
+        previous_state=previous_state,
+        new_state=new_state,
+        previous_location=previous_location,
+        new_location=new_location,
+        confidence=confidence,
+        reason=reason,
+        details=details or {},
+        dedupe_key=dedupe_key,
+    )
+    db.add(event)
+    return event
+
+
+def commit_allowing_event_dedupe_race(db: Session) -> bool:
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if "device_events.dedupe_key" not in str(exc):
+            raise
+        return False
+    return True
+
+
+def find_or_create_observed_identity(db: Session, obs: BLEObservationIn, observed_at: datetime) -> ObservedIdentity:
+    address = normalize_address(obs.address)
+    randomized = is_randomized_address(obs.address_type, address)
+    name = obs.local_name or obs.advertised_name
+    signature = identity_signature(name, obs.service_uuids, obs.manufacturer_data, obs.service_data, obs.appearance)
+    fingerprint = identity_fingerprint(signature)
+
+    identity = None
+    if address:
+        identity = db.execute(
+            select(ObservedIdentity).where(
+                ObservedIdentity.address == address,
+                ObservedIdentity.address_type == (obs.address_type or "unknown"),
+            )
+        ).scalar_one_or_none()
+    if identity is None:
+        identity = ObservedIdentity(
+            address=address,
+            address_type=obs.address_type or "unknown",
+            advertised_name=obs.advertised_name,
+            local_name=obs.local_name,
+            service_uuids=obs.service_uuids,
+            service_data=obs.service_data,
+            manufacturer_data=obs.manufacturer_data,
+            appearance=obs.appearance,
+            advertising_flags=obs.advertising_flags,
+            raw_advertising_payload=obs.raw_advertising_payload,
+            raw_scan_response_payload=obs.raw_scan_response_payload,
+            randomized_address=randomized,
+            fingerprint=fingerprint,
+            first_seen_at=observed_at,
+            last_seen_at=observed_at,
+            observation_count=0,
+        )
+        db.add(identity)
+        db.flush()
+    else:
+        identity.advertised_name = obs.advertised_name or identity.advertised_name
+        identity.local_name = obs.local_name or identity.local_name
+        identity.service_uuids = obs.service_uuids or identity.service_uuids
+        identity.service_data = obs.service_data or identity.service_data
+        identity.manufacturer_data = obs.manufacturer_data or identity.manufacturer_data
+        identity.appearance = obs.appearance or identity.appearance
+        identity.advertising_flags = obs.advertising_flags or identity.advertising_flags
+        identity.raw_advertising_payload = obs.raw_advertising_payload or identity.raw_advertising_payload
+        identity.raw_scan_response_payload = obs.raw_scan_response_payload or identity.raw_scan_response_payload
+        identity.randomized_address = identity.randomized_address or randomized
+        identity.last_seen_at = latest_datetime(identity.last_seen_at, observed_at)
+
+    identity.observation_count += 1
+    return identity
+
+
+def find_or_create_logical_device(
+    db: Session,
+    scanner: Scanner,
+    identity: ObservedIdentity,
+    obs: BLEObservationIn,
+    observed_at: datetime,
+) -> tuple[LogicalDevice, float, str]:
+    address = normalize_address(obs.address)
+    latest_observation = db.execute(
+        select(Observation)
+        .where(Observation.observed_identity_id == identity.id)
+        .order_by(desc(Observation.observed_at))
+        .limit(1)
+    ).scalar_one_or_none()
+    if latest_observation is not None:
+        logical = db.get(LogicalDevice, latest_observation.logical_device_id)
+        if logical is not None and address:
+            return logical, 0.95, "same_observed_identity"
+
+    name = obs.local_name or obs.advertised_name
+    signature = identity_signature(name, obs.service_uuids, obs.manufacturer_data, obs.service_data, obs.appearance)
+    randomized = identity.randomized_address
+    category = obs.device_category or infer_device_category(name, obs.service_uuids)
+
+    if address and not randomized:
+        logical_matches = db.execute(
+            select(LogicalDevice).where(
+                LogicalDevice.primary_address == address,
+                LogicalDevice.primary_address_type == (obs.address_type or "unknown"),
+            ).order_by(desc(LogicalDevice.last_seen_at))
+        ).scalars()
+        for logical in logical_matches:
+            return logical, 0.98, "stable_address_match"
+
+    logical = LogicalDevice(
+        primary_address=address,
+        primary_address_type=obs.address_type or "unknown",
+        display_name=name or address or "Unknown BLE device",
+        # The scanner API can report a manufacturer-data value without giving us
+        # the raw AD structure needed to independently verify it.  Set this only
+        # after canonical payload parsing in process_observation().
+        vendor=None,
+        category=category,
+        status="newly_detected",
+        movement_status="stationary",
+        identity_confidence=0.55 if randomized else 0.85,
+        location_confidence=0.0,
+        current_scanner_id=scanner.id,
+        current_zone=scanner.zone or scanner.room,
+        latitude=scanner.latitude,
+        longitude=scanner.longitude,
+        location_anchor_observed_at=observed_at,
+        first_seen_at=observed_at,
+        last_seen_at=observed_at,
+        observation_count=0,
+        identity_signature=signature,
+    )
+    db.add(logical)
+    db.flush()
+    create_event(
+        db,
+        "device_discovered",
+        observed_at,
+        scanner_id=scanner.id,
+        logical_device_id=logical.id,
+        observed_identity_id=identity.id,
+        new_state="newly_detected",
+        confidence=logical.identity_confidence,
+        reason="first_logical_observation",
+        details={"address": address, "randomized_address": randomized},
+        dedupe_key=f"device-discovered:{logical.id}",
+    )
+    return logical, logical.identity_confidence, "created_new_logical_device"
+
+
+def canonicalize_observation_payload(obs: BLEObservationIn) -> tuple[BLEObservationIn, dict[str, Any]]:
+    has_raw_capture = bool(obs.raw_advertising_payload or obs.raw_scan_response_payload)
+    if obs.payload_layout_version != 2:
+        return obs, {
+            "capture_status": "legacy_payload_layout_unverified" if has_raw_capture else "raw_payload_not_captured",
+            "field_source": "scanner_api_unverified",
+            "payload_layout_version": obs.payload_layout_version,
+        }
+    if not has_raw_capture:
+        return obs, {
+            "capture_status": "raw_payload_not_captured",
+            "field_source": "scanner_api_unverified",
+            "payload_layout_version": obs.payload_layout_version,
+        }
+
+    parsed = parse_advertising_and_scan_response(
+        obs.raw_advertising_payload,
+        obs.raw_scan_response_payload,
+    )
+    fields = parsed["fields"]
+    canonical = obs.model_copy(
+        update={
+            "advertised_name": fields["name"],
+            "local_name": fields["name"],
+            "tx_power": fields["tx_power"],
+            "service_uuids": fields["service_uuids"],
+            "service_data": fields["service_data"],
+            "manufacturer_data": fields["manufacturer_data"],
+            "appearance": fields["appearance"],
+            "advertising_flags": fields["advertising_flags"],
+        }
+    )
+    return canonical, {
+        "capture_status": "verified" if parsed["capture_complete"] else "partial_with_parse_errors",
+        "field_source": "raw_ad_structures",
+        "payload_layout_version": obs.payload_layout_version,
+        "ad_parser": parsed,
+    }
+
+
+def effective_observation_time(
+    obs: BLEObservationIn,
+    batch: ObservationBatchIn,
+    received_at: datetime,
+) -> tuple[datetime, datetime | None, dict[str, Any]]:
+    reported_value = obs.observed_at or obs.scanner_time
+    reported_at = ensure_utc(reported_value) if reported_value else None
+    source = obs.time_source or batch.time_source or "unspecified"
+    clock_sync_age_ms = obs.clock_sync_age_ms if obs.clock_sync_age_ms is not None else batch.clock_sync_age_ms
+    is_synchronized = source in {"usb_host_synchronized", "ntp_synchronized"}
+    provenance: dict[str, Any] = {
+        "reported_time": serialize_datetime(reported_at),
+        "source": source,
+        "boot_id": obs.boot_id or batch.boot_id,
+        "monotonic_ms": obs.monotonic_ms,
+        "scan_cycle": obs.scan_cycle,
+        "batch_sequence": batch.batch_sequence,
+        "clock_sync_age_ms": clock_sync_age_ms,
+        "server_received_at": serialize_datetime(received_at),
+    }
+
+    if is_synchronized and reported_at is not None and clock_sync_age_ms is not None:
+        if clock_sync_age_ms <= TRUSTED_CLOCK_SYNC_MAX_AGE_MS and reported_at <= received_at + MAX_FUTURE_OBSERVATION_SKEW:
+            provenance["effective_time_source"] = "scanner_synchronized_clock"
+            provenance["time_quality"] = "trusted"
+            return reported_at, reported_at, provenance
+        provenance["effective_time_source"] = "server_received_fallback"
+        provenance["time_quality"] = "untrusted"
+        provenance["fallback_reason"] = (
+            "clock_sync_age_exceeded" if clock_sync_age_ms > TRUSTED_CLOCK_SYNC_MAX_AGE_MS else "future_timestamp"
+        )
+        return received_at, reported_at, provenance
+
+    provenance["effective_time_source"] = "server_received_fallback"
+    provenance["time_quality"] = "untrusted"
+    provenance["fallback_reason"] = "scanner_clock_not_synchronized_or_not_reported"
+    return received_at, reported_at, provenance
+
+
+def process_observation(
+    db: Session,
+    scanner: Scanner,
+    config: ScannerConfiguration,
+    batch: ObservationBatchIn,
+    obs: BLEObservationIn,
+    received_at: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    address = normalize_address(obs.address)
+    if is_synthetic_address_pattern(address):
+        return False, {
+            "ignored": True,
+            "reason": "synthetic_address_pattern",
+            "address": address,
+            "observation_id": obs.observation_id,
+        }
+
+    duplicate = db.execute(
+        select(Observation).where(
+            Observation.scanner_id == scanner.id,
+            Observation.observation_id == obs.observation_id,
+        )
+    ).scalar_one_or_none()
+    if duplicate is not None:
+        return False, {"duplicate": True, "observation_id": obs.observation_id}
+
+    obs, capture_provenance = canonicalize_observation_payload(obs)
+    observed_at, scanner_time, time_provenance = effective_observation_time(obs, batch, received_at)
+    identity = find_or_create_observed_identity(db, obs, observed_at)
+    logical, identity_confidence, correlation_reason = find_or_create_logical_device(db, scanner, identity, obs, observed_at)
+
+    previous_status = logical.status
+    previous_movement = logical.movement_status
+    previous_band = logical.proximity_band
+    previous_scanner_id = logical.current_scanner_id
+    previous_zone = logical.current_zone
+    previous_latitude = logical.latitude
+    previous_longitude = logical.longitude
+    previous_anchor_observed_at = logical.location_anchor_observed_at
+    previous_smoothed = logical.smoothed_rssi
+    is_current_observation = (
+        logical.last_seen_at is None
+        or observed_at >= ensure_utc(logical.last_seen_at)
+    )
+
+    smoothed = (
+        float(obs.rssi)
+        if not is_current_observation
+        else float(obs.rssi)
+    )
+    rssi_metrics = (
+        rssi_window_metrics(rssi_samples_for_window_metric(db, logical.id, scanner.id, obs.rssi))
+        if is_current_observation
+        else rssi_window_metrics({})
+    )
+    # The paper uses a five-reading window average. Use that same average for
+    # the current scanner's displayed RSSI whenever the window exists; raw RSSI
+    # is retained until enough readings have arrived.
+    smoothed = rssi_metrics.current_window_means.get(scanner.id, smoothed)
+    proximity = infer_proximity_from_rssi(smoothed, rssi_metrics)
+    proximity_model = proximity_model_payload(proximity, obs.rssi, smoothed, rssi_metrics)
+    distance = proximity.distance_m
+    band = proximity.band
+    if rssi_metrics.rssi_metric is not None and rssi_metrics.rssi_metric >= rssi_metrics.movement_threshold:
+        movement = MovementResult(
+            "probably_moving",
+            round(rssi_metrics.rssi_metric, 2),
+            "paper_rssi_metric_above_threshold",
+        )
+    elif rssi_metrics.rssi_metric is not None:
+        movement = MovementResult(
+            "signal_stable",
+            round(rssi_metrics.reliability or 0.0, 2),
+            "paper_rssi_metric_below_threshold",
+        )
+    else:
+        movement = MovementResult("stationary", 0.0, "rssi_window_not_ready")
+
+    manufacturer_profile = analyze_manufacturer_data(obs.manufacturer_data)
+    gatt_enrichment = obs.gatt_enrichment
+    gatt_name = gatt_enrichment.device_name.strip() if gatt_enrichment and gatt_enrichment.device_name else None
+    raw_capture_verified = capture_provenance.get("capture_status") == "verified"
+    # A Bluetooth SIG Company Identifier identifies the manufacturer-data
+    # namespace, not necessarily the physical product manufacturer.  We expose
+    # it only when the ID came from a successfully parsed raw ADV capture.
+    vendor = manufacturer_profile.get("company_name") if raw_capture_verified else None
+    category = obs.device_category or infer_device_category(
+        gatt_name or obs.local_name or obs.advertised_name,
+        obs.service_uuids,
+        obs.manufacturer_data if raw_capture_verified else None,
+    )
+    estimate_zone = scanner.zone or scanner.room
+    estimate_location_confidence = location_confidence_for_proximity(proximity, scanner)
+    scanner_has_coordinates = scanner.latitude is not None and scanner.longitude is not None
+    anchor_needs_coordinates = logical.latitude is None or logical.longitude is None
+    updates_location_anchor = is_current_observation and (
+        logical.current_scanner_id is None
+        or logical.current_scanner_id != scanner.id
+        or (anchor_needs_coordinates and scanner_has_coordinates)
+    )
+
+    if is_current_observation:
+        returned = observed_again_status(logical.status)
+        if logical.status == "identity_expired":
+            logical.status = "active"
+            create_event(
+                db,
+                "device_identity_reappeared",
+                observed_at,
+                scanner_id=scanner.id,
+                logical_device_id=logical.id,
+                observed_identity_id=identity.id,
+                previous_state=previous_status,
+                new_state="active",
+                confidence=identity_confidence,
+                reason="randomized_address_observed_again",
+                dedupe_key=f"identity-reappeared:{logical.id}:{observed_at.strftime('%Y%m%d%H%M')}",
+            )
+        elif returned:
+            logical.status = "active" if returned[0] != "returned" else "returned"
+            create_event(
+                db,
+                "device_returned" if returned[0] == "returned" else "device_seen",
+                observed_at,
+                scanner_id=scanner.id,
+                logical_device_id=logical.id,
+                observed_identity_id=identity.id,
+                previous_state=previous_status,
+                new_state=logical.status,
+                confidence=0.85,
+                reason=returned[1],
+                dedupe_key=f"{returned[0]}:{logical.id}:{observed_at.strftime('%Y%m%d%H%M')}",
+            )
+        elif logical.status in {"newly_detected", "returned"}:
+            logical.status = "active"
+
+        logical.movement_status = movement.status
+        logical.movement_confidence = movement.confidence
+        logical.identity_confidence = max(logical.identity_confidence or 0.0, identity_confidence)
+        logical.location_confidence = estimate_location_confidence
+        if logical.location_anchor_observed_at is None:
+            logical.location_anchor_observed_at = logical.last_seen_at or observed_at
+        if updates_location_anchor:
+            logical.current_scanner_id = scanner.id
+            logical.current_zone = estimate_zone
+            logical.latitude = scanner.latitude if scanner_has_coordinates else None
+            logical.longitude = scanner.longitude if scanner_has_coordinates else None
+            logical.location_anchor_observed_at = observed_at
+        logical.proximity_band = band
+        logical.estimated_distance_m = distance
+        logical.smoothed_rssi = smoothed
+        logical.last_seen_at = observed_at
+        if gatt_name:
+            logical.display_name = gatt_name
+        else:
+            logical.display_name = logical.display_name or obs.local_name or obs.advertised_name
+        if vendor:
+            logical.vendor = vendor
+        logical.category = logical.category or category
+        logical.identity_signature = identity_signature(
+            obs.local_name or obs.advertised_name,
+            obs.service_uuids,
+            obs.manufacturer_data,
+            obs.service_data,
+            obs.appearance,
+        )
+    logical.observation_count += 1
+
+    location_changed = updates_location_anchor and previous_scanner_id is not None and (
+        previous_scanner_id != logical.current_scanner_id
+        or previous_zone != logical.current_zone
+        or previous_latitude != logical.latitude
+        or previous_longitude != logical.longitude
+    )
+    if location_changed:
+        create_event(
+            db,
+            "device_location_changed",
+            observed_at,
+            scanner_id=scanner.id,
+            logical_device_id=logical.id,
+            observed_identity_id=identity.id,
+            previous_location=previous_zone or previous_scanner_id,
+            new_location=estimate_zone or scanner.id,
+            confidence=logical.location_confidence,
+            reason="observed_by_different_scanner",
+            details={
+                "previous_scanner_id": previous_scanner_id,
+                "current_scanner_id": logical.current_scanner_id,
+                "previous_zone": previous_zone,
+                "current_zone": logical.current_zone,
+                "previous_anchor_latitude": previous_latitude,
+                "previous_anchor_longitude": previous_longitude,
+                "current_anchor_latitude": logical.latitude,
+                "current_anchor_longitude": logical.longitude,
+                "previous_anchor_observed_at": serialize_datetime(previous_anchor_observed_at),
+                "current_anchor_observed_at": serialize_datetime(logical.location_anchor_observed_at),
+            },
+            dedupe_key=(
+                f"device-location:{logical.id}:{previous_scanner_id or 'none'}:{scanner.id}:"
+                f"{observed_at.strftime('%Y%m%d%H%M')}"
+            ),
+        )
+
+    if (
+        is_current_observation
+        and previous_movement != movement.status
+        and movement.status in {"probably_moving", "signal_stable"}
+    ):
+        create_event(
+            db,
+            "device_movement_changed",
+            observed_at,
+            scanner_id=scanner.id,
+            logical_device_id=logical.id,
+            observed_identity_id=identity.id,
+            previous_state=previous_movement,
+            new_state=movement.status,
+            previous_location=previous_band,
+            new_location=band,
+            confidence=movement.confidence,
+            reason=movement.reason,
+            details={"previous_smoothed_rssi": previous_smoothed, "smoothed_rssi": smoothed, "rssi": obs.rssi},
+            dedupe_key=f"movement:{logical.id}:{movement.status}:{observed_at.strftime('%Y%m%d%H%M')}",
+        )
+
+    if is_current_observation and not location_changed and previous_band != band:
+        create_event(
+            db,
+            "device_location_estimate_changed",
+            observed_at,
+            scanner_id=scanner.id,
+            logical_device_id=logical.id,
+            observed_identity_id=identity.id,
+            previous_location=previous_band,
+            new_location=band,
+            confidence=logical.location_confidence,
+            reason="proximity_band_changed",
+            details={"zone": estimate_zone, "distance_m": distance, "proximity_model": proximity_model},
+            dedupe_key=f"location:{logical.id}:{band}:{observed_at.strftime('%Y%m%d%H%M')}",
+        )
+
+    observation = Observation(
+        scanner_id=scanner.id,
+        batch_id=batch.batch_id,
+        observation_id=obs.observation_id,
+        observed_identity_id=identity.id,
+        logical_device_id=logical.id,
+        observed_at=observed_at,
+        scanner_time=scanner_time,
+        server_received_at=received_at,
+        processed_at=utcnow(),
+        rssi=obs.rssi,
+        tx_power=obs.tx_power,
+        estimated_distance_m=distance,
+        advertising_type=obs.advertising_type,
+        service_uuids=obs.service_uuids,
+        service_data=obs.service_data,
+        manufacturer_data=obs.manufacturer_data,
+        appearance=obs.appearance,
+        advertising_flags=obs.advertising_flags,
+        connectable=obs.connectable,
+        raw_advertising_payload=obs.raw_advertising_payload,
+        raw_scan_response_payload=obs.raw_scan_response_payload,
+        packet_length=obs.packet_length,
+        firmware_version=batch.firmware_version,
+        scanner_uptime_seconds=batch.scanner_uptime_seconds,
+        processing_notes={
+            "correlation_reason": correlation_reason,
+            "manufacturer_profile": manufacturer_profile,
+            "proximity_model": proximity_model,
+            "updates_current_location": updates_location_anchor,
+            "location_anchor_policy": "different_scanner_or_missing_anchor",
+            "capture_provenance": capture_provenance,
+            "time_provenance": time_provenance,
+            "gatt_enrichment": gatt_enrichment.model_dump(mode="json") if gatt_enrichment else None,
+        },
+    )
+    db.add(observation)
+    if gatt_enrichment is not None:
+        db.add(
+            DeviceEnrichment(
+                logical_device_id=logical.id,
+                observed_identity_id=identity.id,
+                scanner_id=scanner.id,
+                source_observation_id=obs.observation_id,
+                enriched_at=observed_at,
+                transport="ble_gatt",
+                status=gatt_enrichment.status,
+                device_name=gatt_name,
+                manufacturer_name=gatt_enrichment.manufacturer_name,
+                model_number=gatt_enrichment.model_number,
+                serial_number=gatt_enrichment.serial_number,
+                firmware_revision=gatt_enrichment.firmware_revision,
+                hardware_revision=gatt_enrichment.hardware_revision,
+                software_revision=gatt_enrichment.software_revision,
+                system_id=gatt_enrichment.system_id,
+                pnp_id=gatt_enrichment.pnp_id,
+                discovered_services=gatt_enrichment.discovered_services,
+                characteristic_values=gatt_enrichment.characteristic_values,
+                error_code=gatt_enrichment.error_code,
+                attempt_duration_ms=gatt_enrichment.attempt_duration_ms,
+                details={
+                    "directly_read": True,
+                    "pairing_forced": False,
+                    "address": identity.address,
+                    "address_type": identity.address_type,
+                },
+            )
+        )
+    db.add(
+        DeviceLocationEstimate(
+            logical_device_id=logical.id,
+            scanner_id=scanner.id,
+            estimated_at=observed_at,
+            zone=estimate_zone,
+            proximity_band=band,
+            estimated_distance_m=distance,
+            confidence=estimate_location_confidence,
+            method=proximity.method,
+            details={
+                "rssi": obs.rssi,
+                "smoothed_rssi": smoothed,
+                "proximity_model": proximity_model,
+                "scanner_latitude": scanner.latitude,
+                "scanner_longitude": scanner.longitude,
+                "updates_current_anchor": updates_location_anchor,
+                "anchor_scanner_id": logical.current_scanner_id,
+                "anchor_latitude": logical.latitude,
+                "anchor_longitude": logical.longitude,
+            },
+        )
+    )
+
+    scanner.last_seen_at = received_at
+    return True, {"duplicate": False, "logical_device_id": logical.id, "status": logical.status}
+
+
+def location_confidence_for_proximity(proximity: Any, scanner: Scanner) -> float:
+    # A scanner's configured zone is its own installation location. RSSI from
+    # one scanner is not evidence that the device occupies that exact zone.
+    return 0.0
+
+
+def _correlation_setting(db: Session, key: str) -> Any:
+    setting = db.get(SystemSetting, key)
+    return setting.value if setting is not None else DEFAULT_SETTINGS[key][0]
+
+
+def _bounded_correlation_number(
+    value: Any,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not number == number or number < minimum or number > maximum:
+        return default
+    return number
+
+
+def correlation_config(db: Session) -> dict[str, Any]:
+    configured_alpha = _correlation_setting(db, "correlation_alpha")
+    alpha: float | None = None
+    if configured_alpha is not None:
+        candidate = _bounded_correlation_number(configured_alpha, 0.0, 0.000001, 10_000.0)
+        if candidate > 0:
+            alpha = candidate
+    max_cost_value = _correlation_setting(db, "correlation_statistical_max_cost")
+    max_cost: float | None = None
+    if max_cost_value is not None:
+        candidate = _bounded_correlation_number(max_cost_value, 0.0, 0.000001, 86_400.0)
+        if candidate > 0:
+            max_cost = candidate
+    return {
+        "rotation_window_seconds": _bounded_correlation_number(
+            _correlation_setting(db, "correlation_rotation_window_seconds"), 20.0, 1.0, 3600.0
+        ),
+        "evaluation_window_seconds": _bounded_correlation_number(
+            _correlation_setting(db, "correlation_evaluation_window_seconds"), 20.0, 1.0, 3600.0
+        ),
+        "min_regression_samples": int(
+            _bounded_correlation_number(
+                _correlation_setting(db, "correlation_min_regression_samples"), 3.0, 2.0, 100.0
+            )
+        ),
+        "alpha": alpha,
+        "unmatched_cost": _bounded_correlation_number(
+            _correlation_setting(db, "correlation_unmatched_cost_seconds"), 30.0, 0.001, 86_400.0
+        ),
+        "auto_accept_statistical": _correlation_setting(db, "correlation_auto_accept_statistical") is True,
+        "statistical_max_cost": max_cost,
+        "token_carryover_max_seconds": _bounded_correlation_number(
+            _correlation_setting(db, "correlation_token_carryover_max_seconds"), 3600.0, 1.0, 604_800.0
+        ),
+        "token_min_observations": int(
+            _bounded_correlation_number(
+                _correlation_setting(db, "correlation_token_min_observations"), 2.0, 1.0, 100.0
+            )
+        ),
+        "token_rules": parse_token_rules(_correlation_setting(db, "correlation_token_rules")),
+    }
+
+
+def _identity_observations(db: Session, identity_id: str) -> list[Observation]:
+    return db.execute(
+        select(Observation)
+        .where(Observation.observed_identity_id == identity_id)
+        .order_by(Observation.observed_at)
+    ).scalars().all()
+
+
+def _trusted_rssi_points(
+    observations: list[Observation],
+    start: datetime,
+    end: datetime,
+    scanner_id: str,
+) -> list[tuple[datetime, int]]:
+    points: list[tuple[datetime, int]] = []
+    for observation in observations:
+        observed_at = ensure_utc(observation.observed_at)
+        if observation.scanner_id != scanner_id or observed_at < start or observed_at > end:
+            continue
+        notes = observation.processing_notes if isinstance(observation.processing_notes, dict) else {}
+        provenance = notes.get("time_provenance") if isinstance(notes, dict) else None
+        if not isinstance(provenance, dict) or provenance.get("time_quality") != "trusted":
+            continue
+        points.append((observed_at, observation.rssi))
+    return points
+
+
+def _identity_token_evidence(observations: list[Observation], rules: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    evidence: dict[str, dict[str, Any]] = {}
+    for observation in observations:
+        notes = observation.processing_notes if isinstance(observation.processing_notes, dict) else {}
+        capture = notes.get("capture_provenance") if isinstance(notes, dict) else None
+        parser = capture.get("ad_parser") if isinstance(capture, dict) else None
+        for token_hash, token in extract_approved_tokens(parser, rules).items():
+            item = evidence.setdefault(token_hash, {**token, "observation_count": 0})
+            item["observation_count"] += 1
+    return evidence
+
+
+def _logical_for_identity(observations: list[Observation]) -> LogicalDevice | None:
+    if not observations:
+        return None
+    # All observations of an observed identity are reassigned when an accepted
+    # correlation is merged, so the latest row identifies the canonical record.
+    return observations[-1].logical_device
+
+
+def _correlation_exists(
+    db: Session,
+    predecessor_identity_id: str,
+    successor_identity_id: str,
+    method: str,
+) -> bool:
+    return (
+        db.execute(
+            select(DeviceIdentityCorrelation.id).where(
+                DeviceIdentityCorrelation.predecessor_identity_id == predecessor_identity_id,
+                DeviceIdentityCorrelation.successor_identity_id == successor_identity_id,
+                DeviceIdentityCorrelation.method == method,
+            )
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def _accepted_correlation_for_successor(db: Session, successor_identity_id: str) -> bool:
+    return (
+        db.execute(
+            select(DeviceIdentityCorrelation.id).where(
+                DeviceIdentityCorrelation.successor_identity_id == successor_identity_id,
+                DeviceIdentityCorrelation.status == "accepted",
+            )
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def _record_identity_correlation(
+    db: Session,
+    *,
+    predecessor_identity: ObservedIdentity,
+    successor_identity: ObservedIdentity,
+    predecessor_device: LogicalDevice,
+    successor_device: LogicalDevice,
+    method: str,
+    status: str,
+    details: dict[str, Any],
+    time_difference_seconds: float | None = None,
+    rssi_difference_db: float | None = None,
+    assignment_cost: float | None = None,
+    alpha: float | None = None,
+    search_window_seconds: float | None = None,
+    evaluation_window_seconds: float | None = None,
+    accepted_at: datetime | None = None,
+) -> DeviceIdentityCorrelation | None:
+    if _correlation_exists(db, predecessor_identity.id, successor_identity.id, method):
+        return None
+    correlation = DeviceIdentityCorrelation(
+        predecessor_identity_id=predecessor_identity.id,
+        successor_identity_id=successor_identity.id,
+        predecessor_logical_device_id=predecessor_device.id,
+        successor_logical_device_id=successor_device.id,
+        method=method,
+        status=status,
+        time_difference_seconds=time_difference_seconds,
+        rssi_difference_db=rssi_difference_db,
+        assignment_cost=assignment_cost,
+        alpha=alpha,
+        search_window_seconds=search_window_seconds,
+        evaluation_window_seconds=evaluation_window_seconds,
+        details=details,
+        accepted_at=accepted_at,
+    )
+    db.add(correlation)
+    return correlation
+
+
+def _merge_accepted_identity_correlation(
+    db: Session,
+    correlation: DeviceIdentityCorrelation,
+    predecessor_device: LogicalDevice,
+    successor_device: LogicalDevice,
+    successor_observations: list[Observation],
+) -> None:
+    """Make the successor's latest verified scanner location canonical.
+
+    The older location history is retained by reassigning estimates and events
+    to the predecessor record.  This is the Tebet -> Bekasi flow, but only
+    after the correlation has been accepted by an approved evidence path.
+    """
+
+    if predecessor_device.id == successor_device.id:
+        return
+    previous_scanner_id = predecessor_device.current_scanner_id
+    previous_zone = predecessor_device.current_zone
+    successor_seen_at = ensure_utc(successor_device.last_seen_at)
+    if successor_seen_at >= ensure_utc(predecessor_device.last_seen_at):
+        for field in (
+            "status",
+            "movement_status",
+            "location_confidence",
+            "movement_confidence",
+            "current_scanner_id",
+            "current_zone",
+            "proximity_band",
+            "estimated_distance_m",
+            "smoothed_rssi",
+            "latitude",
+            "longitude",
+            "location_anchor_observed_at",
+            "last_seen_at",
+        ):
+            setattr(predecessor_device, field, getattr(successor_device, field))
+        predecessor_device.primary_address = successor_device.primary_address
+        predecessor_device.primary_address_type = successor_device.primary_address_type
+        predecessor_device.display_name = predecessor_device.display_name or successor_device.display_name
+        predecessor_device.vendor = predecessor_device.vendor or successor_device.vendor
+        predecessor_device.category = predecessor_device.category or successor_device.category
+    predecessor_device.first_seen_at = min(
+        ensure_utc(predecessor_device.first_seen_at),
+        ensure_utc(successor_device.first_seen_at),
+    )
+    predecessor_device.observation_count += successor_device.observation_count
+
+    db.execute(
+        Observation.__table__.update()
+        .where(Observation.logical_device_id == successor_device.id)
+        .values(logical_device_id=predecessor_device.id)
+    )
+    db.execute(
+        DeviceLocationEstimate.__table__.update()
+        .where(DeviceLocationEstimate.logical_device_id == successor_device.id)
+        .values(logical_device_id=predecessor_device.id)
+    )
+    db.execute(
+        DeviceEvent.__table__.update()
+        .where(DeviceEvent.logical_device_id == successor_device.id)
+        .values(logical_device_id=predecessor_device.id)
+    )
+    successor_device.ignored = True
+    successor_device.status = "merged"
+    successor_device.movement_status = "merged"
+
+    moved_between_scanners = previous_scanner_id and previous_scanner_id != predecessor_device.current_scanner_id
+    if moved_between_scanners:
+        predecessor_device.movement_status = "relocated_between_scanners"
+        predecessor_device.movement_confidence = 0.0
+    create_event(
+        db,
+        "device_identity_correlated",
+        successor_seen_at,
+        scanner_id=predecessor_device.current_scanner_id,
+        logical_device_id=predecessor_device.id,
+        observed_identity_id=correlation.successor_identity_id,
+        previous_location=previous_zone or previous_scanner_id,
+        new_location=predecessor_device.current_zone or predecessor_device.current_scanner_id,
+        confidence=0.0,
+        reason="approved_ad_token_carryover",
+        details={
+            "correlation_method": correlation.method,
+            "correlation_status": correlation.status,
+            "identity_evidence": correlation.details,
+            "previous_scanner_id": previous_scanner_id,
+            "current_scanner_id": predecessor_device.current_scanner_id,
+            "successor_observation_count": len(successor_observations),
+        },
+        dedupe_key=(
+            f"identity-correlation:{correlation.predecessor_identity_id}:"
+            f"{correlation.successor_identity_id}:{correlation.method}"
+        ),
+    )
+
+
+def run_identity_correlation(db: Session, include_statistical_review: bool = True) -> dict[str, int]:
+    """Run auditable address-rotation correlation after a batch is flushed.
+
+    This implements the time/RSSI cost from Akiyama and Taniguchi for proposals
+    only.  It deliberately does not treat a cost as a probability or merge
+    unknown devices by name, vendor, UUID, RSSI, location, or time alone.
+    """
+
+    config = correlation_config(db)
+    if not config["token_rules"] and not include_statistical_review and not config["auto_accept_statistical"]:
+        return {"accepted": 0, "proposals": 0}
+    identities = db.execute(
+        select(ObservedIdentity)
+        .where(ObservedIdentity.randomized_address.is_(True))
+        .order_by(ObservedIdentity.first_seen_at)
+        .limit(500)
+    ).scalars().all()
+    observations_by_identity = {identity.id: _identity_observations(db, identity.id) for identity in identities}
+    metadata: dict[str, tuple[Observation, Observation, LogicalDevice]] = {}
+    for identity in identities:
+        observations = observations_by_identity[identity.id]
+        device = _logical_for_identity(observations)
+        if observations and device is not None:
+            metadata[identity.id] = (observations[0], observations[-1], device)
+
+    accepted = 0
+    proposals = 0
+    token_evidence = {
+        identity.id: _identity_token_evidence(observations_by_identity[identity.id], config["token_rules"])
+        for identity in identities
+    }
+
+    # Direct carryover is intentionally unavailable until an operator has
+    # approved a protocol-specific, locally unique AD token rule.
+    if config["token_rules"]:
+        for successor in identities:
+            if successor.id not in metadata or _accepted_correlation_for_successor(db, successor.id):
+                continue
+            successor_first, _, successor_device = metadata[successor.id]
+            successor_at = ensure_utc(successor_first.observed_at)
+            for token_hash, token in token_evidence[successor.id].items():
+                candidates: list[tuple[ObservedIdentity, LogicalDevice]] = []
+                for predecessor in identities:
+                    if predecessor.id == successor.id or predecessor.id not in metadata:
+                        continue
+                    predecessor_token = token_evidence[predecessor.id].get(token_hash)
+                    if predecessor_token is None or predecessor_token["observation_count"] < config["token_min_observations"]:
+                        continue
+                    _, predecessor_last, predecessor_device = metadata[predecessor.id]
+                    gap = (successor_at - ensure_utc(predecessor_last.observed_at)).total_seconds()
+                    if 0 <= gap <= config["token_carryover_max_seconds"]:
+                        candidates.append((predecessor, predecessor_device))
+                if len(candidates) != 1:
+                    continue
+                predecessor, predecessor_device = candidates[0]
+                if _correlation_exists(db, predecessor.id, successor.id, "approved_ad_token_carryover"):
+                    continue
+                _, predecessor_last, _ = metadata[predecessor.id]
+                time_delta = (successor_at - ensure_utc(predecessor_last.observed_at)).total_seconds()
+                correlation = _record_identity_correlation(
+                    db,
+                    predecessor_identity=predecessor,
+                    successor_identity=successor,
+                    predecessor_device=predecessor_device,
+                    successor_device=successor_device,
+                    method="approved_ad_token_carryover",
+                    status="accepted",
+                    accepted_at=successor_at,
+                    time_difference_seconds=time_delta,
+                    search_window_seconds=config["token_carryover_max_seconds"],
+                    details={
+                        "rule_id": token["rule_id"],
+                        "ad_type": token["ad_type"],
+                        "company_id": token.get("company_id"),
+                        "service_uuid": token.get("service_uuid"),
+                        "token_hash": token_hash,
+                        "token_bit_length": token["bit_length"],
+                        "predecessor_token_observations": token_evidence[predecessor.id][token_hash]["observation_count"],
+                        "successor_token_observations": token["observation_count"],
+                        "candidate_count": 1,
+                        "acceptance_basis": "operator_approved_protocol_token_rule",
+                    },
+                )
+                if correlation is not None:
+                    db.flush()
+                    _merge_accepted_identity_correlation(
+                        db,
+                        correlation,
+                        predecessor_device,
+                        successor_device,
+                        observations_by_identity[successor.id],
+                    )
+                    accepted += 1
+                break
+
+    if not include_statistical_review and not config["auto_accept_statistical"]:
+        return {"accepted": accepted, "proposals": proposals}
+
+    raw_pairs: list[tuple[ObservedIdentity, ObservedIdentity, LogicalDevice, LogicalDevice, float, float, int, int]] = []
+    for successor in identities:
+        if successor.id not in metadata or _accepted_correlation_for_successor(db, successor.id):
+            continue
+        successor_first, successor_last, successor_device = metadata[successor.id]
+        successor_at = ensure_utc(successor_first.observed_at)
+        successor_end = successor_at + timedelta(seconds=config["evaluation_window_seconds"])
+        successor_points = _trusted_rssi_points(
+            observations_by_identity[successor.id],
+            successor_at,
+            successor_end,
+            successor_first.scanner_id,
+        )
+        if len(successor_points) < config["min_regression_samples"]:
+            continue
+        for predecessor in identities:
+            if predecessor.id == successor.id or predecessor.id not in metadata:
+                continue
+            predecessor_first, predecessor_last, predecessor_device = metadata[predecessor.id]
+            predecessor_at = ensure_utc(predecessor_last.observed_at)
+            if predecessor_last.scanner_id != successor_first.scanner_id:
+                continue
+            time_delta = (successor_at - predecessor_at).total_seconds()
+            if time_delta < 0 or time_delta > config["rotation_window_seconds"]:
+                continue
+            predecessor_start = predecessor_at - timedelta(seconds=config["evaluation_window_seconds"])
+            predecessor_points = _trusted_rssi_points(
+                observations_by_identity[predecessor.id],
+                predecessor_start,
+                predecessor_at,
+                predecessor_last.scanner_id,
+            )
+            if len(predecessor_points) < config["min_regression_samples"]:
+                continue
+            difference = rssi_regression_difference(predecessor_points, successor_points)
+            if difference is None:
+                continue
+            rho, predecessor_samples, successor_samples = difference
+            raw_pairs.append(
+                (
+                    predecessor,
+                    successor,
+                    predecessor_device,
+                    successor_device,
+                    time_delta,
+                    rho,
+                    predecessor_samples,
+                    successor_samples,
+                )
+            )
+
+    if raw_pairs:
+        alpha = config["alpha"] or alpha_from_p90_overlap(
+            [pair[4] for pair in raw_pairs], [pair[5] for pair in raw_pairs]
+        )
+        if alpha is not None:
+            pair_costs = {}
+            pair_context: dict[tuple[str, str], tuple[ObservedIdentity, ObservedIdentity, LogicalDevice, LogicalDevice]] = {}
+            for predecessor, successor, predecessor_device, successor_device, _, rho, predecessor_samples, successor_samples in raw_pairs:
+                predecessor_last = metadata[predecessor.id][1]
+                successor_first = metadata[successor.id][0]
+                cost = akiyama_pair_cost(
+                    ensure_utc(predecessor_last.observed_at),
+                    ensure_utc(successor_first.observed_at),
+                    rho,
+                    alpha,
+                    config["rotation_window_seconds"],
+                    predecessor_samples,
+                    successor_samples,
+                )
+                if cost is not None:
+                    pair_costs[(predecessor.id, successor.id)] = cost
+                    pair_context[(predecessor.id, successor.id)] = (
+                        predecessor,
+                        successor,
+                        predecessor_device,
+                        successor_device,
+                    )
+            predecessor_ids = sorted({key[0] for key in pair_costs})
+            successor_ids = sorted({key[1] for key in pair_costs})
+            for predecessor_id, successor_id, pair in assign_akiyama_pairs(
+                predecessor_ids,
+                successor_ids,
+                pair_costs,
+                config["unmatched_cost"],
+            ):
+                predecessor, successor, predecessor_device, successor_device = pair_context[(predecessor_id, successor_id)]
+                if _correlation_exists(db, predecessor_id, successor_id, "akiyama_time_rssi_linear_assignment_v1"):
+                    continue
+                can_accept = (
+                    config["auto_accept_statistical"]
+                    and config["statistical_max_cost"] is not None
+                    and pair.cost <= config["statistical_max_cost"]
+                )
+                status = "accepted" if can_accept else "proposal"
+                successor_at = ensure_utc(metadata[successor.id][0].observed_at)
+                correlation = _record_identity_correlation(
+                    db,
+                    predecessor_identity=predecessor,
+                    successor_identity=successor,
+                    predecessor_device=predecessor_device,
+                    successor_device=successor_device,
+                    method="akiyama_time_rssi_linear_assignment_v1",
+                    status=status,
+                    accepted_at=successor_at if can_accept else None,
+                    time_difference_seconds=pair.time_difference_seconds,
+                    rssi_difference_db=pair.rssi_difference_db,
+                    assignment_cost=pair.cost,
+                    alpha=pair.alpha,
+                    search_window_seconds=config["rotation_window_seconds"],
+                    evaluation_window_seconds=config["evaluation_window_seconds"],
+                    details={
+                        "formula": "sqrt(tau^2 + (alpha * rho)^2)",
+                        "rss_prediction": "linear_regression_from_predecessor_window",
+                        "time_quality": "trusted_scanner_clock_only",
+                        "scanner_id": metadata[successor.id][0].scanner_id,
+                        "predecessor_sample_count": pair.predecessor_sample_count,
+                        "successor_sample_count": pair.successor_sample_count,
+                        "alpha_source": "configured" if config["alpha"] is not None else "per_run_p90_width_matching",
+                        "unmatched_cost": config["unmatched_cost"],
+                        "automatic_acceptance": can_accept,
+                    },
+                )
+                if correlation is None:
+                    continue
+                if can_accept:
+                    db.flush()
+                    _merge_accepted_identity_correlation(
+                        db,
+                        correlation,
+                        predecessor_device,
+                        successor_device,
+                        observations_by_identity[successor.id],
+                    )
+                    accepted += 1
+                else:
+                    proposals += 1
+    return {"accepted": accepted, "proposals": proposals}
+
+
+def process_batch(db: Session, scanner: Scanner, payload: ObservationBatchIn) -> dict[str, Any]:
+    received_at = utcnow()
+    config = get_scanner_config(db, scanner.id)
+    accepted = 0
+    duplicates = 0
+    ignored = 0
+    errors = 0
+    logical_device_ids: set[str] = set()
+    previous_status = scanner.status
+
+    for obs in payload.observations:
+        try:
+            ok, result = process_observation(db, scanner, config, payload, obs, received_at)
+            if ok:
+                accepted += 1
+                if result.get("logical_device_id"):
+                    logical_device_ids.add(result["logical_device_id"])
+            elif result.get("duplicate"):
+                duplicates += 1
+            elif result.get("ignored"):
+                ignored += 1
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            db.add(
+                ProcessingError(
+                    scanner_id=scanner.id,
+                    batch_id=payload.batch_id,
+                    observation_id=obs.observation_id,
+                    error_category=exc.__class__.__name__,
+                    message=str(exc),
+                    payload_excerpt=obs.model_dump(mode="json", exclude_none=True),
+                )
+            )
+
+    scanner.last_seen_at = received_at
+    scanner.status = "online"
+    if previous_status != "online":
+        create_event(
+            db,
+            "scanner_connected",
+            scanner_id=scanner.id,
+            occurred_at=received_at,
+            previous_state=previous_status,
+            new_state="online",
+            confidence=0.9,
+            reason="observation_batch_received",
+            dedupe_key=f"scanner-connected:{scanner.id}:{received_at.strftime('%Y%m%d%H%M')}",
+        )
+    db.flush()
+    try:
+        correlations = run_identity_correlation(db, include_statistical_review=False)
+    except Exception as exc:  # noqa: BLE001
+        correlations = {"accepted": 0, "proposals": 0}
+        errors += 1
+        db.add(
+            ProcessingError(
+                scanner_id=scanner.id,
+                batch_id=payload.batch_id,
+                error_category="identity_correlation_error",
+                message=str(exc),
+            )
+        )
+    db.commit()
+    return {
+        "accepted": accepted,
+        "duplicates": duplicates,
+        "ignored": ignored,
+        "errors": errors,
+        "logical_device_ids": sorted(logical_device_ids),
+        "identity_correlations": correlations,
+    }
+
+
+def refresh_presence_states(db: Session, settings: Settings) -> list[DeviceEvent]:
+    now = utcnow()
+    events: list[DeviceEvent] = []
+    processing_settings = ProcessingSettings(
+        presence_missing_seconds=settings.presence_missing_seconds,
+        presence_offline_seconds=settings.presence_offline_seconds,
+    )
+    devices = db.execute(select(LogicalDevice).where(LogicalDevice.ignored.is_(False))).scalars().all()
+    identity_bases = presence_identity_bases(db, devices)
+    changed = False
+    for device in devices:
+        result = evaluate_presence_status(device.status, device.last_seen_at, now, processing_settings)
+        unresolved_random = identity_bases.get(device.id) == "unresolved_randomized_address"
+        if unresolved_random and device.status == "identity_expired":
+            continue
+        if unresolved_random and device.status == "offline":
+            result = ("identity_expired", "randomized_address_not_correlated")
+        elif unresolved_random and result is not None and result[0] == "offline":
+            result = ("identity_expired", "randomized_address_not_correlated")
+        if result is None:
+            continue
+        new_status, reason = result
+        previous = device.status
+        device.status = new_status
+        changed = True
+        event = create_event(
+            db,
+            f"device_{new_status}",
+            now,
+            scanner_id=device.current_scanner_id,
+            logical_device_id=device.id,
+            previous_state=previous,
+            new_state=new_status,
+            confidence=0.8,
+            reason=reason,
+            dedupe_key=f"presence:{device.id}:{new_status}:{now.strftime('%Y%m%d%H%M')}",
+            severity="warning" if new_status == "offline" else "info",
+        )
+        if event is not None:
+            events.append(event)
+    if not changed:
+        return []
+    if not commit_allowing_event_dedupe_race(db):
+        return []
+    return events
+
+
+def refresh_scanner_states(db: Session, settings: Settings) -> list[DeviceEvent]:
+    now = utcnow()
+    timeout_at = now - timedelta(seconds=settings.heartbeat_timeout_seconds)
+    events: list[DeviceEvent] = []
+    scanners = db.execute(select(Scanner).where(Scanner.enabled.is_(True))).scalars()
+    changed = False
+    for scanner in scanners:
+        latest_signal_at = scanner.last_heartbeat_at
+        if scanner.last_seen_at is not None:
+            latest_signal_at = latest_datetime(latest_signal_at, scanner.last_seen_at) if latest_signal_at else scanner.last_seen_at
+        if latest_signal_at and ensure_utc(latest_signal_at) < timeout_at and scanner.status != "offline":
+            previous = scanner.status
+            scanner.status = "offline"
+            changed = True
+            event = create_event(
+                db,
+                "scanner_disconnected",
+                now,
+                scanner_id=scanner.id,
+                previous_state=previous,
+                new_state="offline",
+                confidence=1.0,
+                reason="heartbeat_timeout",
+                dedupe_key=f"scanner-offline:{scanner.id}:{now.strftime('%Y%m%d%H%M')}",
+                severity="warning",
+            )
+            if event is not None:
+                events.append(event)
+    if not changed:
+        return []
+    if not commit_allowing_event_dedupe_race(db):
+        return []
+    return events
+
+
+def serialize_scanner(scanner: Scanner) -> dict[str, Any]:
+    return {
+        "id": scanner.id,
+        "display_name": scanner.display_name,
+        "hardware_id": scanner.hardware_id,
+        "installation_name": scanner.installation_name,
+        "status": scanner.status,
+        "enabled": scanner.enabled,
+        "building": scanner.building,
+        "floor": scanner.floor,
+        "room": scanner.room,
+        "zone": scanner.zone,
+        "latitude": scanner.latitude,
+        "longitude": scanner.longitude,
+        "indoor_x": scanner.indoor_x,
+        "indoor_y": scanner.indoor_y,
+        "orientation_deg": scanner.orientation_deg,
+        "firmware_version": scanner.firmware_version,
+        "hardware_version": scanner.hardware_version,
+        "last_heartbeat_at": serialize_datetime(scanner.last_heartbeat_at),
+        "last_seen_at": serialize_datetime(scanner.last_seen_at),
+        "uptime_seconds": scanner.uptime_seconds,
+        "config_version": scanner.config_version,
+        "network_info": scanner.network_info,
+        "maintenance_notes": scanner.maintenance_notes,
+    }
+
+
+def proximity_model_from_estimate(estimate: DeviceLocationEstimate | None) -> dict[str, Any] | None:
+    if estimate is None or not isinstance(estimate.details, dict):
+        return None
+    model = estimate.details.get("proximity_model")
+    return model if isinstance(model, dict) else None
+
+
+def proximity_model_from_observation(observation: Observation) -> dict[str, Any] | None:
+    if not isinstance(observation.processing_notes, dict):
+        return None
+    model = observation.processing_notes.get("proximity_model")
+    return model if isinstance(model, dict) else None
+
+
+def capture_provenance_from_observation(observation: Observation | None) -> dict[str, Any]:
+    if observation is None or not isinstance(observation.processing_notes, dict):
+        return {}
+    capture = observation.processing_notes.get("capture_provenance")
+    return capture if isinstance(capture, dict) else {}
+
+
+def manufacturer_profile_from_observation(observation: Observation | None) -> dict[str, Any]:
+    """Return company metadata only when raw AD parsing verified its source."""
+    capture = capture_provenance_from_observation(observation)
+    capture_status = capture.get("capture_status") or "capture_evidence_missing"
+    if observation is not None and capture_status == "verified":
+        profile = analyze_manufacturer_data(observation.manufacturer_data)
+        return {**profile, "evidence": "raw_advertising_verified"}
+    return {
+        "company_id": None,
+        "company_name": None,
+        "evidence": capture_status,
+    }
+
+
+def latest_location_estimates(db: Session, logical_device_ids: list[str]) -> dict[str, DeviceLocationEstimate]:
+    if not logical_device_ids:
+        return {}
+
+    latest_timestamps = (
+        select(
+            DeviceLocationEstimate.logical_device_id.label("logical_device_id"),
+            func.max(DeviceLocationEstimate.estimated_at).label("estimated_at"),
+        )
+        .where(DeviceLocationEstimate.logical_device_id.in_(logical_device_ids))
+        .group_by(DeviceLocationEstimate.logical_device_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(DeviceLocationEstimate)
+        .join(
+            latest_timestamps,
+            and_(
+                DeviceLocationEstimate.logical_device_id == latest_timestamps.c.logical_device_id,
+                DeviceLocationEstimate.estimated_at == latest_timestamps.c.estimated_at,
+            ),
+        )
+        .order_by(DeviceLocationEstimate.logical_device_id, desc(DeviceLocationEstimate.id))
+    ).scalars()
+    latest: dict[str, DeviceLocationEstimate] = {}
+    for row in rows:
+        # Multiple rows can share a timestamp; preserve one stable primary-key
+        # tie-breaker without materializing the complete estimate history.
+        latest.setdefault(row.logical_device_id, row)
+    return latest
+
+
+def latest_observations(db: Session, logical_device_ids: list[str]) -> dict[str, Observation]:
+    if not logical_device_ids:
+        return {}
+
+    latest_timestamps = (
+        select(
+            Observation.logical_device_id.label("logical_device_id"),
+            func.max(Observation.observed_at).label("observed_at"),
+        )
+        .where(Observation.logical_device_id.in_(logical_device_ids))
+        .group_by(Observation.logical_device_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Observation)
+        .join(
+            latest_timestamps,
+            and_(
+                Observation.logical_device_id == latest_timestamps.c.logical_device_id,
+                Observation.observed_at == latest_timestamps.c.observed_at,
+            ),
+        )
+        .order_by(Observation.logical_device_id, desc(Observation.id))
+    ).scalars()
+    latest: dict[str, Observation] = {}
+    for row in rows:
+        latest.setdefault(row.logical_device_id, row)
+    return latest
+
+
+def latest_device_enrichments(db: Session, logical_device_ids: list[str]) -> dict[str, DeviceEnrichment]:
+    if not logical_device_ids:
+        return {}
+
+    rows = db.execute(
+        select(DeviceEnrichment)
+        .where(DeviceEnrichment.logical_device_id.in_(logical_device_ids))
+        .order_by(DeviceEnrichment.logical_device_id, desc(DeviceEnrichment.enriched_at), desc(DeviceEnrichment.id))
+    ).scalars()
+    latest: dict[str, DeviceEnrichment] = {}
+    for row in rows:
+        latest.setdefault(row.logical_device_id, row)
+    return latest
+
+
+def serialize_device_enrichment(enrichment: DeviceEnrichment) -> dict[str, Any]:
+    return {
+        "id": enrichment.id,
+        "scanner_id": enrichment.scanner_id,
+        "observed_identity_id": enrichment.observed_identity_id,
+        "source_observation_id": enrichment.source_observation_id,
+        "enriched_at": serialize_datetime(enrichment.enriched_at),
+        "transport": enrichment.transport,
+        "status": enrichment.status,
+        "device_name": enrichment.device_name,
+        "manufacturer_name": enrichment.manufacturer_name,
+        "model_number": enrichment.model_number,
+        "serial_number": enrichment.serial_number,
+        "firmware_revision": enrichment.firmware_revision,
+        "hardware_revision": enrichment.hardware_revision,
+        "software_revision": enrichment.software_revision,
+        "system_id": enrichment.system_id,
+        "pnp_id": enrichment.pnp_id,
+        "discovered_services": enrichment.discovered_services,
+        "characteristic_values": enrichment.characteristic_values,
+        "error_code": enrichment.error_code,
+        "attempt_duration_ms": enrichment.attempt_duration_ms,
+        "details": enrichment.details,
+    }
+
+
+def serialize_device(
+    device: LogicalDevice,
+    latest_location: DeviceLocationEstimate | None = None,
+    latest_observation: Observation | None = None,
+    latest_enrichment: DeviceEnrichment | None = None,
+    identity_basis: str | None = None,
+) -> dict[str, Any]:
+    proximity_model = proximity_model_from_estimate(latest_location)
+    manufacturer_profile = manufacturer_profile_from_observation(latest_observation)
+    address_type = (device.primary_address_type or "").lower()
+    identity_basis = identity_basis or (
+        "unresolved_randomized_address"
+        if any(token in address_type for token in ("random", "private", "rpa"))
+        else "observed_stable_address"
+    )
+    resolved_name = device.alias or (latest_enrichment.device_name if latest_enrichment else None) or device.display_name
+    name_source = (
+        "operator_alias"
+        if device.alias
+        else "ble_gatt_device_name"
+        if latest_enrichment and latest_enrichment.device_name
+        else "advertising_local_name_or_address"
+    )
+    return {
+        "id": device.id,
+        "alias": device.alias,
+        "display_name": resolved_name,
+        "display_name_source": name_source,
+        "primary_address": device.primary_address,
+        "address_type": device.primary_address_type,
+        "vendor": manufacturer_profile["company_name"],
+        "manufacturer_company_id": manufacturer_profile["company_id"],
+        "manufacturer_evidence": manufacturer_profile["evidence"],
+        "category": device.category,
+        "status": "ignored" if device.ignored else device.status,
+        "movement_status": device.movement_status,
+        "known": device.known,
+        "ignored": device.ignored,
+        "identity_confidence": device.identity_confidence,
+        "identity_basis": identity_basis,
+        "presence_trackable": identity_basis != "unresolved_randomized_address",
+        "location_confidence": device.location_confidence,
+        "movement_confidence": device.movement_confidence,
+        "current_scanner_id": device.current_scanner_id,
+        "current_zone": device.current_zone,
+        "proximity_band": device.proximity_band,
+        "estimated_distance_m": device.estimated_distance_m,
+        "distance_range_m": proximity_model.get("distance_range_m") if proximity_model else None,
+        "proximity_confidence": proximity_model.get("confidence") if proximity_model else device.location_confidence,
+        "proximity_model": proximity_model,
+        "smoothed_rssi": device.smoothed_rssi,
+        "latitude": device.latitude,
+        "longitude": device.longitude,
+        "location_anchor": {
+            "scanner_id": device.current_scanner_id,
+            "zone": device.current_zone,
+            "latitude": device.latitude,
+            "longitude": device.longitude,
+            "anchored_at": serialize_datetime(device.location_anchor_observed_at),
+            "source": "scanner_snapshot_at_observation",
+            "update_policy": "different_scanner_or_missing_anchor",
+        },
+        "first_seen_at": serialize_datetime(device.first_seen_at),
+        "last_seen_at": serialize_datetime(device.last_seen_at),
+        "observation_count": device.observation_count,
+        "notes": device.notes,
+        "tags": device.tags,
+        "gatt_enrichment": serialize_device_enrichment(latest_enrichment) if latest_enrichment else None,
+    }
+
+
+def serialize_recent_observation(observation: Observation) -> dict[str, Any]:
+    proximity_model = proximity_model_from_observation(observation)
+    processing_notes = observation.processing_notes if isinstance(observation.processing_notes, dict) else {}
+    return {
+        "id": observation.id,
+        "observed_at": serialize_datetime(observation.observed_at),
+        "scanner_time": serialize_datetime(observation.scanner_time),
+        "server_received_at": serialize_datetime(observation.server_received_at),
+        "scanner_id": observation.scanner_id,
+        "rssi": observation.rssi,
+        "tx_power": observation.tx_power,
+        "estimated_distance_m": observation.estimated_distance_m,
+        "proximity_model": proximity_model,
+        "proximity_band": proximity_model.get("band") if proximity_model else proximity_band(observation.estimated_distance_m, observation.rssi),
+        "raw_advertising_payload": observation.raw_advertising_payload,
+        "raw_scan_response_payload": observation.raw_scan_response_payload,
+        "capture_provenance": processing_notes.get("capture_provenance"),
+        "time_provenance": processing_notes.get("time_provenance"),
+        "gatt_enrichment": processing_notes.get("gatt_enrichment"),
+    }
+
+
+def serialize_event(event: DeviceEvent) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "event_type": event.event_type,
+        "severity": event.severity,
+        "scanner_id": event.scanner_id,
+        "logical_device_id": event.logical_device_id,
+        "observed_identity_id": event.observed_identity_id,
+        "occurred_at": serialize_datetime(event.occurred_at),
+        "previous_state": event.previous_state,
+        "new_state": event.new_state,
+        "previous_location": event.previous_location,
+        "new_location": event.new_location,
+        "confidence": event.confidence,
+        "reason": event.reason,
+        "details": event.details,
+    }
+
+
+def serialize_identity_correlation(correlation: DeviceIdentityCorrelation) -> dict[str, Any]:
+    return {
+        "id": correlation.id,
+        "predecessor_identity_id": correlation.predecessor_identity_id,
+        "successor_identity_id": correlation.successor_identity_id,
+        "method": correlation.method,
+        "status": correlation.status,
+        "time_difference_seconds": correlation.time_difference_seconds,
+        "rssi_difference_db": correlation.rssi_difference_db,
+        "assignment_cost": correlation.assignment_cost,
+        "alpha": correlation.alpha,
+        "search_window_seconds": correlation.search_window_seconds,
+        "evaluation_window_seconds": correlation.evaluation_window_seconds,
+        "details": correlation.details,
+        "created_at": serialize_datetime(correlation.created_at),
+        "accepted_at": serialize_datetime(correlation.accepted_at),
+    }
+
+
+def serialize_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return ensure_utc(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def presence_identity_bases(db: Session, devices: list[LogicalDevice]) -> dict[str, str]:
+    """Separate durable presence identities from unresolved random addresses."""
+
+    if not devices:
+        return {}
+    device_ids = [device.id for device in devices]
+    correlated_ids = set(
+        db.execute(
+            select(Observation.logical_device_id)
+            .where(Observation.logical_device_id.in_(device_ids))
+            .group_by(Observation.logical_device_id)
+            .having(func.count(func.distinct(Observation.observed_identity_id)) > 1)
+        ).scalars()
+    )
+    gatt_stable_ids = set(
+        db.execute(
+            select(DeviceEnrichment.logical_device_id)
+            .where(
+                DeviceEnrichment.logical_device_id.in_(device_ids),
+                DeviceEnrichment.status.in_(("success", "partial")),
+                or_(
+                    DeviceEnrichment.serial_number.is_not(None),
+                    DeviceEnrichment.system_id.is_not(None),
+                ),
+            )
+            .distinct()
+        ).scalars()
+    )
+
+    bases: dict[str, str] = {}
+    for device in devices:
+        address_type = (device.primary_address_type or "").lower()
+        randomized = any(token in address_type for token in ("random", "private", "rpa"))
+        if device.known or bool(device.alias):
+            bases[device.id] = "operator_confirmed_identity"
+        elif not randomized:
+            bases[device.id] = "observed_stable_address"
+        elif device.id in gatt_stable_ids:
+            bases[device.id] = "gatt_stable_identifier"
+        elif device.id in correlated_ids:
+            bases[device.id] = "correlated_randomized_identity"
+        else:
+            bases[device.id] = "unresolved_randomized_address"
+    return bases
+
+
+def overview(db: Session) -> dict[str, Any]:
+    scanners = db.execute(select(Scanner)).scalars().all()
+    devices = db.execute(select(LogicalDevice)).scalars().all()
+    identity_bases = presence_identity_bases(db, devices)
+    trackable_devices = [
+        device for device in devices if identity_bases.get(device.id) != "unresolved_randomized_address"
+    ]
+    unresolved_devices = [
+        device for device in devices if identity_bases.get(device.id) == "unresolved_randomized_address"
+    ]
+    recent_since = utcnow() - timedelta(minutes=1)
+    recent_observations = db.execute(select(func.count(Observation.id)).where(Observation.server_received_at >= recent_since)).scalar_one()
+    recent_events = db.execute(select(DeviceEvent).order_by(desc(DeviceEvent.occurred_at)).limit(10)).scalars().all()
+
+    return {
+        "scanner_total": len(scanners),
+        "scanner_online": sum(1 for scanner in scanners if scanner.status == "online"),
+        "scanner_offline": sum(1 for scanner in scanners if scanner.status == "offline"),
+        "active_devices": sum(
+            1 for device in trackable_devices if device.status in {"active", "newly_detected", "returned"}
+        ),
+        "active_unresolved_identities": sum(
+            1 for device in unresolved_devices if device.status in {"active", "newly_detected", "returned"}
+        ),
+        "newly_detected_devices": sum(1 for device in trackable_devices if device.status == "newly_detected"),
+        "moving_devices": sum(
+            1
+            for device in trackable_devices
+            if device.movement_status in {"probably_moving", "relocated_between_scanners"}
+        ),
+        "stationary_devices": sum(1 for device in trackable_devices if device.movement_status == "signal_stable"),
+        "missing_devices": sum(1 for device in trackable_devices if device.status == "temporarily_missing"),
+        "offline_device_records": sum(
+            1
+            for device in devices
+            if device.status == "offline" and identity_bases.get(device.id) != "unresolved_randomized_address"
+        ),
+        "expired_random_identities": sum(
+            1
+            for device in devices
+            if device.status == "identity_expired"
+            or (device.status == "offline" and identity_bases.get(device.id) == "unresolved_randomized_address")
+        ),
+        "ignored_devices": sum(1 for device in devices if device.ignored),
+        "observation_rate_per_minute": recent_observations,
+        "system_health": "ok" if any(scanner.status == "online" for scanner in scanners) or not scanners else "warning",
+        "recent_events": [serialize_event(event) for event in recent_events],
+    }
+
+
+def list_devices(
+    db: Session,
+    status: str | None = None,
+    scanner_id: str | None = None,
+    include_ignored: bool = False,
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    query = select(LogicalDevice).order_by(desc(LogicalDevice.last_seen_at))
+    if status == "present":
+        query = query.where(LogicalDevice.status.in_(("active", "newly_detected", "returned")))
+    elif status:
+        query = query.where(LogicalDevice.status == status)
+    if scanner_id:
+        query = query.where(LogicalDevice.current_scanner_id == scanner_id)
+    if not include_ignored:
+        query = query.where(LogicalDevice.ignored.is_(False))
+    if not include_expired and status != "identity_expired":
+        query = query.where(LogicalDevice.status != "identity_expired")
+    devices = db.execute(query).scalars().all()
+    identity_bases = presence_identity_bases(db, devices)
+    latest = latest_location_estimates(db, [device.id for device in devices])
+    observations = latest_observations(db, [device.id for device in devices])
+    enrichments = latest_device_enrichments(db, [device.id for device in devices])
+    return [
+        serialize_device(
+            device,
+            latest.get(device.id),
+            observations.get(device.id),
+            enrichments.get(device.id),
+            identity_bases.get(device.id),
+        )
+        for device in devices
+    ]
+
+
+def device_detail(db: Session, device_id: str) -> dict[str, Any] | None:
+    device = db.get(LogicalDevice, device_id)
+    if device is None:
+        return None
+    observations = db.execute(
+        select(Observation).where(Observation.logical_device_id == device_id).order_by(desc(Observation.observed_at)).limit(100)
+    ).scalars().all()
+    events = db.execute(
+        select(DeviceEvent).where(DeviceEvent.logical_device_id == device_id).order_by(desc(DeviceEvent.occurred_at)).limit(100)
+    ).scalars().all()
+    identities = db.execute(
+        select(ObservedIdentity)
+        .join(Observation, Observation.observed_identity_id == ObservedIdentity.id)
+        .where(Observation.logical_device_id == device_id)
+        .distinct()
+    ).scalars().all()
+    identity_ids = [identity.id for identity in identities]
+    correlations = []
+    if identity_ids:
+        correlations = db.execute(
+            select(DeviceIdentityCorrelation)
+            .where(
+                or_(
+                    DeviceIdentityCorrelation.predecessor_identity_id.in_(identity_ids),
+                    DeviceIdentityCorrelation.successor_identity_id.in_(identity_ids),
+                )
+            )
+            .order_by(desc(DeviceIdentityCorrelation.created_at))
+            .limit(100)
+        ).scalars().all()
+    location_history = db.execute(
+        select(DeviceLocationEstimate)
+        .where(DeviceLocationEstimate.logical_device_id == device_id)
+        .order_by(desc(DeviceLocationEstimate.estimated_at))
+        .limit(100)
+    ).scalars().all()
+    enrichments = db.execute(
+        select(DeviceEnrichment)
+        .where(DeviceEnrichment.logical_device_id == device_id)
+        .order_by(desc(DeviceEnrichment.enriched_at))
+        .limit(100)
+    ).scalars().all()
+    latest = latest_location_estimates(db, [device_id])
+    latest_by_identity: dict[str, Observation] = {}
+    for observation in observations:
+        latest_by_identity.setdefault(observation.observed_identity_id, observation)
+    observed_identities = []
+    for identity in identities:
+        manufacturer_profile = manufacturer_profile_from_observation(latest_by_identity.get(identity.id))
+        observed_identities.append(
+            {
+                "id": identity.id,
+                "address": identity.address,
+                "address_type": identity.address_type,
+                "advertised_name": identity.advertised_name,
+                "local_name": identity.local_name,
+                "service_uuids": identity.service_uuids,
+                "service_data": identity.service_data,
+                "manufacturer_data": identity.manufacturer_data,
+                "appearance": identity.appearance,
+                "advertising_flags": identity.advertising_flags,
+                "manufacturer_profile": manufacturer_profile,
+                "manufacturer_evidence": manufacturer_profile["evidence"],
+                "randomized_address": identity.randomized_address,
+                "first_seen_at": serialize_datetime(identity.first_seen_at),
+                "last_seen_at": serialize_datetime(identity.last_seen_at),
+                "observation_count": identity.observation_count,
+            }
+        )
+    return {
+        "device": serialize_device(
+            device,
+            latest.get(device_id),
+            observations[0] if observations else None,
+            enrichments[0] if enrichments else None,
+            presence_identity_bases(db, [device]).get(device.id),
+        ),
+        "observed_identities": observed_identities,
+        "recent_observations": [serialize_recent_observation(observation) for observation in observations],
+        "location_history": [
+            {
+                "estimated_at": serialize_datetime(estimate.estimated_at),
+                "scanner_id": estimate.scanner_id,
+                "zone": estimate.zone,
+                "proximity_band": estimate.proximity_band,
+                "estimated_distance_m": estimate.estimated_distance_m,
+                "confidence": estimate.confidence,
+                "method": estimate.method,
+                "details": estimate.details,
+            }
+            for estimate in location_history
+        ],
+        "events": [serialize_event(event) for event in events],
+        "identity_correlations": [serialize_identity_correlation(correlation) for correlation in correlations],
+        "device_enrichments": [serialize_device_enrichment(enrichment) for enrichment in enrichments],
+    }
+
+
+def list_scanners(db: Session) -> list[dict[str, Any]]:
+    scanners = db.execute(select(Scanner).order_by(Scanner.display_name)).scalars().all()
+    return [serialize_scanner(scanner) for scanner in scanners]
+
+
+def patch_scanner(db: Session, scanner_id: str, payload: ScannerPatchIn) -> dict[str, Any] | None:
+    scanner = db.get(Scanner, scanner_id)
+    if scanner is None:
+        return None
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(scanner, field, value)
+    scanner.config_version += 1
+    config = get_scanner_config(db, scanner_id)
+    config.version = scanner.config_version
+    db.commit()
+    db.refresh(scanner)
+    return serialize_scanner(scanner)
+
+
+def list_events(db: Session, event_type: str | None = None, scanner_id: str | None = None, device_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    query = select(DeviceEvent).order_by(desc(DeviceEvent.occurred_at)).limit(min(max(limit, 1), 500))
+    if event_type:
+        query = query.where(DeviceEvent.event_type == event_type)
+    if scanner_id:
+        query = query.where(DeviceEvent.scanner_id == scanner_id)
+    if device_id:
+        query = query.where(DeviceEvent.logical_device_id == device_id)
+    return [serialize_event(event) for event in db.execute(query).scalars().all()]
+
+
+def get_settings_values(db: Session) -> dict[str, Any]:
+    ensure_default_settings(db)
+    rows = db.execute(select(SystemSetting).order_by(SystemSetting.key)).scalars().all()
+    return {row.key: {"value": row.value, "description": row.description, "updated_at": serialize_datetime(row.updated_at)} for row in rows}
+
+
+def patch_settings(db: Session, payload: SettingsPatchIn) -> dict[str, Any]:
+    ensure_default_settings(db)
+    for key, value in payload.values.items():
+        setting = db.get(SystemSetting, key)
+        if setting is None:
+            setting = SystemSetting(key=key, value=value, description="Custom setting.")
+            db.add(setting)
+        else:
+            setting.value = value
+    db.commit()
+    return get_settings_values(db)
+
+
+def diagnostics(db: Session) -> dict[str, Any]:
+    invalid_payload_count = db.execute(select(func.count(ProcessingError.id))).scalar_one()
+    observation_count = db.execute(select(func.count(Observation.id))).scalar_one()
+    event_count = db.execute(select(func.count(DeviceEvent.id))).scalar_one()
+    observed_identity_count = db.execute(select(func.count(ObservedIdentity.id))).scalar_one()
+    randomized_identity_count = db.execute(
+        select(func.count(ObservedIdentity.id)).where(ObservedIdentity.randomized_address.is_(True))
+    ).scalar_one()
+    logical_device_count = db.execute(select(func.count(LogicalDevice.id))).scalar_one()
+    identity_correlation_count = db.execute(select(func.count(DeviceIdentityCorrelation.id))).scalar_one()
+    latest_heartbeat = db.execute(select(ScannerHeartbeat).order_by(desc(ScannerHeartbeat.received_at)).limit(1)).scalar_one_or_none()
+    recent_errors = db.execute(select(ProcessingError).order_by(desc(ProcessingError.created_at)).limit(20)).scalars()
+    return {
+        "server": {"status": "ok", "time": serialize_datetime(utcnow())},
+        "database": {"status": "ok"},
+        "processing": {
+            "invalid_payload_count": invalid_payload_count,
+            "observation_count": observation_count,
+            "event_count": event_count,
+        },
+        "identity_counts": {
+            "observed_identities": observed_identity_count,
+            "randomized_address_identities": randomized_identity_count,
+            "logical_devices": logical_device_count,
+            "identity_correlations": identity_correlation_count,
+        },
+        "latest_heartbeat": {
+            "scanner_id": latest_heartbeat.scanner_id,
+            "received_at": serialize_datetime(latest_heartbeat.received_at),
+            "buffer_usage": latest_heartbeat.buffer_usage,
+            "pending_observations": latest_heartbeat.pending_observations,
+            "dropped_observations": latest_heartbeat.dropped_observations,
+        }
+        if latest_heartbeat
+        else None,
+        "recent_errors": [
+            {
+                "scanner_id": error.scanner_id,
+                "batch_id": error.batch_id,
+                "observation_id": error.observation_id,
+                "error_category": error.error_category,
+                "message": error.message,
+                "created_at": serialize_datetime(error.created_at),
+            }
+            for error in recent_errors
+        ],
+    }
+
+
+def apply_manual_correlation(db: Session, payload: ManualCorrelationIn) -> dict[str, Any]:
+    source = db.get(LogicalDevice, payload.source_logical_device_id)
+    if source is None:
+        raise ValueError("source logical device not found")
+
+    decision = ManualDeviceCorrelationDecision(
+        action=payload.action,
+        source_logical_device_id=payload.source_logical_device_id,
+        target_logical_device_id=payload.target_logical_device_id,
+        observed_identity_id=payload.observed_identity_id,
+        reason=payload.reason,
+    )
+    db.add(decision)
+
+    if payload.action == "mark_known":
+        source.known = True
+    elif payload.action == "mark_ignored":
+        source.ignored = True
+        source.status = "ignored"
+    elif payload.action == "unignore":
+        source.ignored = False
+        source.status = "active"
+    elif payload.action == "merge":
+        if not payload.target_logical_device_id:
+            raise ValueError("target logical device required for merge")
+        target = db.get(LogicalDevice, payload.target_logical_device_id)
+        if target is None:
+            raise ValueError("target logical device not found")
+        db.execute(
+            Observation.__table__.update()
+            .where(Observation.logical_device_id == source.id)
+            .values(logical_device_id=target.id)
+        )
+        source.ignored = True
+        source.status = "merged"
+    elif payload.action == "split":
+        source.status = "active"
+
+    create_event(
+        db,
+        f"manual_device_{payload.action}",
+        utcnow(),
+        logical_device_id=source.id,
+        confidence=1.0,
+        reason=payload.reason or "operator_decision",
+        details=payload.model_dump(exclude_none=True),
+        dedupe_key=f"manual:{payload.action}:{uuid.uuid4()}",
+    )
+    db.commit()
+    return {"accepted": True, "device": serialize_device(source)}

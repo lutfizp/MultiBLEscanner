@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bluetooth Scanner</title>
+    <link rel="stylesheet" href="/dashboard/vendor/leaflet/leaflet.css">
+    <link rel="stylesheet" href="/dashboard/app.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">BT</span>
+          <span>Bluetooth Scanner</span>
+        </div>
+        <nav class="nav" aria-label="Main navigation">
+          <button data-view="overview" class="active">Overview</button>
+          <button data-view="devices">Devices</button>
+          <button data-view="scanners">Scanners</button>
+          <button data-view="locations">Locations</button>
+          <button data-view="events">Events</button>
+          <button data-view="diagnostics">Diagnostics</button>
+        </nav>
+        <div class="connection">
+          <span id="liveState" class="status-dot muted"></span>
+          <span id="liveText">Connecting</span>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <h1 id="viewTitle">Overview</h1>
+          <button id="refreshBtn" class="icon-button" title="Refresh" aria-label="Refresh">↻</button>
+        </header>
+
+        <section id="overview" class="view active">
+          <div id="metricGrid" class="metric-grid"></div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Recent Events</h2>
+            </div>
+            <div id="recentEvents" class="event-list"></div>
+          </div>
+        </section>
+
+        <section id="devices" class="view">
+          <div class="toolbar">
+            <input id="deviceSearch" type="search" placeholder="Search devices...">
+            <select id="deviceStatusFilter">
+              <option value="present" selected>Present devices</option>
+              <option value="">All history</option>
+              <option value="active">Active</option>
+              <option value="temporarily_missing">Temporarily missing</option>
+              <option value="offline">Offline</option>
+              <option value="identity_expired">Expired random address</option>
+              <option value="returned">Returned</option>
+            </select>
+            <label class="checkline"><input id="includeIgnored" type="checkbox"> Include ignored</label>
+            <label class="checkline"><input id="includeExpired" type="checkbox"> Include expired random IDs</label>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Device</th>
+                  <th>Status</th>
+                  <th>SIG Company / Category</th>
+                  <th>Movement</th>
+                  <th>Scanner</th>
+                  <th>Zone</th>
+                  <th>Signal band</th>
+                  <th>RSSI</th>
+                  <th>Last seen</th>
+                </tr>
+              </thead>
+              <tbody id="deviceRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="scanners" class="view">
+          <div class="split-layout">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Registered Scanners</h2>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Status</th>
+                      <th>Location</th>
+                      <th>Firmware</th>
+                      <th>Heartbeat</th>
+                    </tr>
+                  </thead>
+                  <tbody id="scannerRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <form id="scannerForm" class="panel form-panel">
+              <div class="panel-header">
+                <h2>Scanner Configuration</h2>
+              </div>
+              <input type="hidden" name="id">
+              <label>Name <input name="display_name"></label>
+              <label>Building <input name="building"></label>
+              <label>Floor <input name="floor"></label>
+              <label>Room <input name="room"></label>
+              <label>Zone <input name="zone"></label>
+              <label>Latitude <input name="latitude" type="number" step="0.000001"></label>
+              <label>Longitude <input name="longitude" type="number" step="0.000001"></label>
+              <label>Indoor X <input name="indoor_x" type="number" step="0.01"></label>
+              <label>Indoor Y <input name="indoor_y" type="number" step="0.01"></label>
+              <label>Orientation <input name="orientation_deg" type="number" step="1"></label>
+              <button id="detectScannerLocationFormBtn" type="button">Use My Location</button>
+              <label class="checkline"><input name="enabled" type="checkbox"> Enabled</label>
+              <label>Maintenance Notes <textarea name="maintenance_notes" rows="4"></textarea></label>
+              <button type="submit">Save Scanner</button>
+            </form>
+          </div>
+        </section>
+
+        <section id="locations" class="view">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Geospatial & Local Coverage</h2>
+              <div class="panel-actions">
+                <select id="mapScannerSelect"></select>
+                <button id="detectScannerLocationBtn">Use My Location</button>
+              </div>
+            </div>
+            <div class="map-shell">
+              <div id="mapNotice" class="map-notice"></div>
+              <div id="locationCanvas" class="real-map"></div>
+              <div id="addressPanel" class="address-panel"></div>
+              <div id="localCoverage" class="local-coverage"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="events" class="view">
+          <div class="toolbar">
+            <input id="eventTypeFilter" placeholder="Filter by event type...">
+            <button id="eventFilterBtn">Apply Filter</button>
+          </div>
+          <div id="eventList" class="event-list"></div>
+        </section>
+
+        <section id="diagnostics" class="view">
+          <div id="diagnosticsPanel" class="diagnostics-grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="deviceDialog" class="device-dialog" aria-labelledby="deviceDialogTitle">
+      <button id="closeDeviceDialog" class="dialog-close" type="button" title="Close" aria-label="Close">×</button>
+      <div id="deviceDetail" class="detail-panel hidden"></div>
+    </dialog>
+
+    <script src="/dashboard/vendor/leaflet/leaflet.js"></script>
+    <script type="module" src="/dashboard/app.js"></script>
+  </body>
+</html>
