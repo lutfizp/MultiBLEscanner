@@ -8,6 +8,9 @@
 /docs/phase-1-requirement-analysis.md
 /docs/phase-2-technical-design.md
 
+# Research papers and third-party comparison projects
+/references/
+
 # Secrets and local environment
 .env
 .env.*
