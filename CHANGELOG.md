@@ -922,3 +922,14 @@ Limits:
 - The backend still provides `/api/settings` as an engineering API for existing internal policy records. It is no longer exposed by the test console.
 - Repository eligibility is configured, but files cannot be staged or committed until this directory is initialized as a Git repository or connected to its intended repository metadata.
 
+## Phase: Reference Material Exclusion
+
+Changed:
+
+- Excluded the complete `references/` directory because it contains local research papers and third-party comparison projects rather than application source.
+- Removed all previously tracked reference entries while preserving the local files for engineering comparison.
+
+Validation:
+
+- Confirmed `git ls-files references` returns no tracked paths.
+- Confirmed Git ignores files below `references/` and all 516 local reference files remain available.
