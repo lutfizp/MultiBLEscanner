@@ -61,6 +61,11 @@ button:hover {
   background: #f1fafb;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -215,6 +220,34 @@ small {
   margin-bottom: 20px;
 }
 
+.topbar-actions,
+.location-status {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.topbar-actions {
+  gap: 8px;
+}
+
+.location-status {
+  max-width: min(420px, 52vw);
+  gap: 7px;
+  min-height: 34px;
+  color: var(--muted);
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.location-status > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .icon-button,
 .dialog-close {
   display: grid;
@@ -281,12 +314,25 @@ small {
 .panel-actions,
 .detail-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
+.panel-actions {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
 .panel-actions select {
-  min-width: 220px;
+  flex: 0 1 280px;
+  width: 280px;
+  min-width: 190px;
+}
+
+#mapDeviceSelect {
+  flex-basis: 340px;
+  width: 340px;
 }
 
 .toolbar {
@@ -380,6 +426,10 @@ tbody tr {
 
 tbody tr:hover td {
   background: #f4fafb;
+}
+
+tbody tr.selected td {
+  background: #e7f4f5;
 }
 
 tbody tr:last-child td {
@@ -525,21 +575,31 @@ tbody tr:last-child td {
   font-size: 12px;
 }
 
-.device-dialog {
-  width: min(1040px, calc(100vw - 32px));
-  max-width: 1040px;
-  max-height: calc(100vh - 32px);
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1390;
+  background: rgba(12, 18, 21, 0.44);
+}
+
+.device-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 1400;
+  width: min(640px, calc(100vw - 32px));
+  height: 100dvh;
   overflow: auto;
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border: 0;
+  border-left: 1px solid var(--border-strong);
   background: var(--surface);
   color: var(--ink);
   padding: 0;
   box-shadow: var(--shadow);
 }
 
-.device-dialog::backdrop {
-  background: rgba(12, 18, 21, 0.55);
+body.drawer-open {
+  overflow: hidden;
 }
 
 .dialog-close {
@@ -563,6 +623,71 @@ tbody tr:last-child td {
 .detail-panel > .panel-header {
   min-height: 44px;
   padding-right: 48px;
+}
+
+.detail-heading {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.detail-heading h2,
+.detail-heading small {
+  overflow-wrap: anywhere;
+}
+
+.tracking-launch {
+  display: grid;
+  grid-template-columns: auto minmax(132px, auto) minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 14px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 0;
+}
+
+.segmented-control {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+}
+
+.segmented-control button {
+  min-height: 36px;
+  border: 0;
+  border-right: 1px solid var(--border-strong);
+  border-radius: 0;
+  padding: 6px 11px;
+}
+
+.segmented-control button:last-child {
+  border-right: 0;
+}
+
+.segmented-control button[aria-pressed="true"] {
+  background: #dceff1;
+  color: var(--accent-dark);
+}
+
+.primary-action {
+  border-color: var(--accent-dark);
+  background: var(--accent);
+  color: #fff;
+}
+
+.primary-action:hover {
+  background: var(--accent-dark);
+  color: #fff;
+}
+
+.inline-error {
+  min-width: 0;
+  color: var(--danger);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .detail-grid,
@@ -617,6 +742,125 @@ tbody tr:last-child td {
   background: var(--surface);
 }
 
+.signal-finder {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1250;
+  display: grid;
+  gap: 10px;
+  width: min(520px, calc(100vw - 244px));
+  max-height: calc(100dvh - 36px);
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 12px;
+  box-shadow: var(--shadow);
+}
+
+.finder-header,
+.finder-target,
+.finder-actions {
+  display: flex;
+  align-items: center;
+}
+
+.finder-header {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.finder-target {
+  min-width: 0;
+  gap: 9px;
+}
+
+.finder-target > div {
+  display: grid;
+  min-width: 0;
+}
+
+.finder-target strong,
+.finder-target span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finder-target span {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.finder-actions {
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.finder-actions button {
+  min-height: 34px;
+  padding: 5px 9px;
+}
+
+.finder-readout {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 5px 12px;
+  align-items: center;
+}
+
+.signal-meter {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #dfe5e7;
+}
+
+.signal-meter span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--accent);
+  transition: width 160ms linear;
+}
+
+#finderRssi {
+  min-width: 82px;
+  font-size: 18px;
+}
+
+#finderTrend,
+#finderMode {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+#finderMode {
+  text-align: right;
+}
+
+.signal-finder canvas {
+  display: block;
+  width: 100%;
+  height: 92px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+}
+
+.finder-message {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .map-shell {
   display: grid;
   gap: 12px;
@@ -629,6 +873,13 @@ tbody tr:last-child td {
   color: #315258;
   padding: 8px 10px;
   font-size: 12px;
+}
+
+.map-gps-status {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .real-map {
@@ -718,6 +969,42 @@ tbody tr:last-child td {
 
 .device-stack.offline {
   background: var(--danger);
+}
+
+.device-stack.selected {
+  outline: 4px solid rgba(8, 127, 140, 0.32);
+  outline-offset: 3px;
+}
+
+.finder-anchor {
+  position: relative;
+  display: block;
+  width: 34px;
+  height: 34px;
+  border: 3px solid #172126;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.8);
+  box-shadow: 0 2px 8px rgba(23, 33, 38, 0.35);
+}
+
+.finder-anchor::before,
+.finder-anchor::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  content: "";
+  background: #172126;
+  transform: translate(-50%, -50%);
+}
+
+.finder-anchor::before {
+  width: 22px;
+  height: 2px;
+}
+
+.finder-anchor::after {
+  width: 2px;
+  height: 22px;
 }
 
 .leaflet-container {
@@ -816,6 +1103,11 @@ tbody tr:last-child td {
   background: #f1fafb;
 }
 
+.device-chip.selected {
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: #e7f4f5;
+}
+
 .device-chip-name {
   display: flex;
   align-items: center;
@@ -894,6 +1186,10 @@ tbody tr:last-child td {
     margin-bottom: 14px;
   }
 
+  .location-status {
+    max-width: 54vw;
+  }
+
   h1 {
     font-size: 21px;
   }
@@ -918,6 +1214,7 @@ tbody tr:last-child td {
 
   .panel-actions select,
   .panel-actions button {
+    flex: 1 1 100%;
     min-width: 0;
     width: 100%;
   }
@@ -950,13 +1247,33 @@ tbody tr:last-child td {
     border-right: 0;
   }
 
-  .device-dialog {
-    width: calc(100vw - 16px);
-    max-height: calc(100vh - 16px);
+  .device-drawer {
+    top: auto;
+    bottom: 0;
+    width: 100%;
+    height: min(82dvh, 760px);
+    border-top: 1px solid var(--border-strong);
+    border-left: 0;
   }
 
   .detail-panel {
     padding: 14px 12px 20px;
+  }
+
+  .tracking-launch {
+    grid-template-columns: minmax(0, 1fr) minmax(130px, 1fr);
+  }
+
+  .inline-error {
+    grid-column: 1 / -1;
+  }
+
+  .signal-finder {
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    width: auto;
+    max-height: min(52dvh, 420px);
   }
 }
 
@@ -980,6 +1297,27 @@ tbody tr:last-child td {
 
   .detail-actions {
     flex-wrap: wrap;
+  }
+
+  .tracking-launch {
+    grid-template-columns: 1fr;
+  }
+
+  .inline-error {
+    grid-column: auto;
+  }
+
+  .finder-header {
+    align-items: flex-start;
+  }
+
+  .finder-readout {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  #finderMode {
+    grid-column: 1 / -1;
+    text-align: left;
   }
 
   .kv {

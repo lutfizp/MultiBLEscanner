@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Bluetooth Scanner</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/dashboard/vendor/leaflet/leaflet.css">
     <link rel="stylesheet" href="/dashboard/app.css">
   </head>
@@ -31,7 +32,13 @@
       <main class="content">
         <header class="topbar">
           <h1 id="viewTitle">Overview</h1>
-          <button id="refreshBtn" class="icon-button" title="Refresh" aria-label="Refresh">↻</button>
+          <div class="topbar-actions">
+            <button id="gpsStatusBtn" class="location-status" type="button" title="Scanner location status">
+              <span id="gpsStatusDot" class="status-dot warning"></span>
+              <span id="gpsStatusText">Starting location</span>
+            </button>
+            <button id="refreshBtn" class="icon-button" title="Refresh" aria-label="Refresh">↻</button>
+          </div>
         </header>
 
         <section id="overview" class="view active">
@@ -57,6 +64,7 @@
               <option value="returned">Returned</option>
             </select>
             <label class="checkline"><input id="includeIgnored" type="checkbox"> Include ignored</label>
+            <label class="checkline"><input id="includeTransient" type="checkbox"> Include transient broadcasts</label>
             <label class="checkline"><input id="includeExpired" type="checkbox"> Include expired random IDs</label>
           </div>
           <div class="table-wrap">
@@ -129,6 +137,10 @@
               <h2>Geospatial & Local Coverage</h2>
               <div class="panel-actions">
                 <select id="mapScannerSelect"></select>
+                <select id="mapDeviceSelect" aria-label="Select anchored Bluetooth device">
+                  <option value="">Select a Bluetooth device</option>
+                </select>
+                <button id="fitMapBtn" type="button" title="Fit scanner and device markers">Fit</button>
                 <button id="detectScannerLocationBtn">Use My Location</button>
               </div>
             </div>
@@ -155,10 +167,37 @@
       </main>
     </div>
 
-    <dialog id="deviceDialog" class="device-dialog" aria-labelledby="deviceDialogTitle">
-      <button id="closeDeviceDialog" class="dialog-close" type="button" title="Close" aria-label="Close">×</button>
+    <div id="deviceDrawerBackdrop" class="drawer-backdrop hidden"></div>
+    <aside id="deviceDrawer" class="device-drawer hidden" aria-labelledby="deviceDialogTitle" aria-hidden="true">
+      <button id="closeDeviceDrawer" class="dialog-close" type="button" title="Close" aria-label="Close">×</button>
       <div id="deviceDetail" class="detail-panel hidden"></div>
-    </dialog>
+    </aside>
+
+    <section id="signalFinder" class="signal-finder hidden" aria-live="polite">
+      <header class="finder-header">
+        <div class="finder-target">
+          <span id="finderStateDot" class="status-dot muted"></span>
+          <div>
+            <strong id="finderTargetName">Signal finder</strong>
+            <span id="finderSessionState">Not started</span>
+          </div>
+        </div>
+        <div class="finder-actions">
+          <button id="finderSoundBtn" type="button">Mute</button>
+          <button id="stopFinderBtn" type="button">Stop</button>
+        </div>
+      </header>
+      <div class="finder-readout">
+        <div class="signal-meter" role="meter" aria-label="Bluetooth signal strength" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="finderMeterFill"></span>
+        </div>
+        <strong id="finderRssi">Waiting</strong>
+        <span id="finderTrend">No advertisement received</span>
+        <span id="finderMode">Fixed measurement</span>
+      </div>
+      <canvas id="finderChart" width="520" height="92" aria-label="Live RSSI history"></canvas>
+      <p id="finderMessage" class="finder-message"></p>
+    </section>
 
     <script src="/dashboard/vendor/leaflet/leaflet.js"></script>
     <script type="module" src="/dashboard/app.js"></script>

@@ -16,7 +16,7 @@ The implementation preserves the distinction between measured data and inference
 ## Requirements
 
 - Python 3.9 or newer on macOS or Linux. The local runner currently uses a POSIX process lock.
-- An original ESP32-compatible `esp32dev` board for the supplied firmware.
+- The detected ESP32-D0WD-V3 development board, supported through PlatformIO's `esp32dev` target.
 - A USB data cable and stable USB power.
 - Internet access during dependency and PlatformIO package installation.
 - Optional browser internet access when using the test console's map and reverse-geocoding helpers.
@@ -99,7 +99,9 @@ The firmware performs active BLE scans and emits framed request messages over US
 - returns backend status and configuration responses to the firmware;
 - reconnects after temporary USB detachments.
 
-Firmware release `esp32-ble-scanner-1.3.1` captures separate ADV and scan-response payloads, uses a bounded RAM queue, keeps IDs stable across retries, uploads at most 12 observations per serial frame, and attempts bounded GATT Device Name and Device Information reads for eligible connectable advertisers. It does not force pairing.
+Firmware release `esp32-ble-scanner-1.5.0` targets the detected ESP32-D0WD-V3 board and pins NimBLE-Arduino 2.5.0. It captures separate ADV and scan-response payloads down to the practical `-110 dBm` receiver floor, uses bounded normal and focused-sample RAM queues, keeps IDs stable across retries, and uploads at most 12 normal observations per serial frame. Configuration, heartbeat, serial framing, HTTP acknowledgement waits, and upload retries run in a dedicated FreeRTOS transport task, so a slow or missing backend acknowledgement cannot pause the BLE scan loop. The host forwarding deadline remains 8 seconds and the firmware ACK deadline remains 12 seconds. Eligible GATT Device Name and Device Information reads run in one isolated worker with a 15-second pipeline deadline. The reader does not force pairing; protected values are reported as `security_required`.
+
+When the backend assigns a focused tracking session, the firmware temporarily uses continuous duplicate-enabled active scanning for only the accepted address/address-type pairs of the selected logical device. It emits dedicated RSSI samples every 200 ms at most and uploads them separately from normal observations. A valid current focus sample refreshes presence for that exact already-accepted identity, including RSSI and return state. It cannot create a device, run correlation, infer movement, or move a durable location anchor.
 
 The current firmware is BLE-only. Bluetooth Classic inquiry, Remote Name Request, A2DP discovery, and SDP are not implemented. A Classic-only TWS device can therefore be absent from this system.
 
@@ -122,12 +124,28 @@ Stop the runner with one `Ctrl+C`. The server closes SSE connections, terminates
 The backend uses a durable location anchor:
 
 - a new logical device is anchored to the scanner-coordinate snapshot at observation time;
-- changing the coordinates of the same scanner ID does not drag existing device anchors;
-- a newer accepted observation by another scanner ID can move the logical device anchor;
+- changing scanner coordinates alone does not alter any device record;
+- every newer accepted BLE observation snapshots the latest reported position of its scanner, including observations from the same scanner after that scanner moves;
+- heartbeat and scanner-position updates never move a device without a BLE observation;
+- a missing or offline device remains at its last observation anchor;
 - delayed observations cannot rewind the current anchor;
 - the RSSI-derived radius remains an uncertainty model around that snapshot.
 
+When the bundled test console opens on the scanner host, it immediately starts a persistent browser `watchPosition` for `LOCAL_SCANNER_ID`. Every valid Safari/macOS Location Services fix is posted through the dedicated scanner-position endpoint with its source timestamp and reported accuracy. This live position path does not increment firmware configuration. The last reported fix remains available with its age and accuracy when Safari has not emitted a newer callback; it is never replaced by an IP-derived or fabricated coordinate.
+
 With one scanner, left, right, forward, floor, room, and exact device coordinates cannot be derived from RSSI. Movement status means radio-sequence change, not a measured trajectory.
+
+## Focused Signal Finder
+
+The test console can start a focused session from a stored BLE device. This is an operator-guided search surface backed by dedicated tracking APIs, not a direction-finding solver.
+
+- Fixed mode keeps all measurements at the scanner-location snapshot captured when the session starts.
+- Walk mode records browser geolocation alongside RSSI while the scanner is moved. The browser device must remain physically co-located with the cable-connected ESP32; otherwise the path is not scanner-position evidence.
+- A stronger RSSI meter or tone means that the accepted advertisement was received more strongly at the scanner. It does not identify a bearing.
+- Only one target can use a scanner at a time. The browser renews a 30-second lease and Stop releases the assignment.
+- Reloading and starting the same stored device renews the existing session. A different device receives a conflict until the first session is stopped or expires.
+
+The map displays measurement anchors and paths. It never writes Walk positions into scanner installation coordinates or the device's normal location anchor.
 
 ## Identity And Presence Semantics
 
@@ -135,9 +153,11 @@ A raw observed identity represents an address and its captured Bluetooth evidenc
 
 - Stable/public addresses can retain normal present, missing, offline, and returned states.
 - Unresolved random/private addresses expire as `identity_expired`; they are not presented as confirmed offline physical devices.
+- The Devices and Location views hide unresolved manufacturer-only random broadcasts by default. A random advertiser with a directly captured Local Name remains visible as a named candidate, but it is not promoted to durable identity.
 - Bluetooth SIG Company Identifier identifies a manufacturer-data namespace, not necessarily the product manufacturer or owner.
 - Similar names, RSSI, service UUIDs, company IDs, and payload layouts do not automatically prove physical identity.
 - Direct GATT names and model values improve display information but are not automatically unique identifiers.
+- Apple Continuity TLVs, short-lived tag carryover, Handoff IV continuity, time, RSSI, and GATT model can produce an auditable possible-match proposal. This path never auto-merges or claims confirmed physical identity.
 
 ## Development Commands
 
@@ -152,6 +172,7 @@ Run a specific test module while changing processing behavior:
 
 ```bash
 .venv/bin/python -m pytest tests/test_processing.py -q
+.venv/bin/python -m pytest tests/test_tracking.py -q
 ```
 
 Any model change requires an Alembic migration. `run.py` applies migrations automatically, while production deployment should run migration as a distinct release step before application traffic is enabled.

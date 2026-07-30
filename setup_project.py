@@ -4,13 +4,16 @@ import argparse
 import os
 import re
 import secrets
+import shutil
 import subprocess
+import sys
 import venv
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_ROOT / ".venv"
+LOCAL_TLS_DIR = PROJECT_ROOT / ".local" / "tls"
 SCANNER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{3,64}$")
 
 
@@ -20,6 +23,11 @@ def venv_python() -> Path:
 
 def run(command: list[str]) -> None:
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+
+
+def project_path(value: str, project_root: Path = PROJECT_ROOT) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else project_root / path
 
 
 def ensure_venv() -> Path:
@@ -59,6 +67,15 @@ def ensure_environment_file(project_root: Path = PROJECT_ROOT) -> dict[str, str]
         values.pop("DATABASE_URL", None)
         values.setdefault("BLUETOOTH_SCANNER_DATA_DIR", ".")
 
+    if values.get("ESP32_BRIDGE_TIMEOUT") == "60":
+        existing_lines = [
+            "ESP32_BRIDGE_TIMEOUT=8"
+            if line.startswith("ESP32_BRIDGE_TIMEOUT=")
+            else line
+            for line in existing_lines
+        ]
+        values["ESP32_BRIDGE_TIMEOUT"] = "8"
+
     default_data_dir = "." if (project_root / "bluetooth_scanner.sqlite3").exists() else "data"
     defaults = {
         "APP_NAME": "Bluetooth Scanner",
@@ -83,12 +100,16 @@ def ensure_environment_file(project_root: Path = PROJECT_ROOT) -> dict[str, str]
         "SUMMARY_RETENTION_DAYS": "365",
         "RUN_HOST": "127.0.0.1",
         "RUN_PORT": "8000",
+        "RUN_HTTPS": "false",
+        "RUN_TLS_CERTFILE": ".local/tls/localhost.pem",
+        "RUN_TLS_KEYFILE": ".local/tls/localhost-key.pem",
+        "RUN_TLS_CA_FILE": ".local/tls/local-ca.pem",
         "ESP32_SERIAL_ENABLED": "true",
         "ESP32_SERIAL_PORT": "auto",
         "ESP32_SERIAL_BAUD": "115200",
         "ESP32_SERIAL_START_DELAY": "2.5",
         "ESP32_SERIAL_RETRY_SECONDS": "2",
-        "ESP32_BRIDGE_TIMEOUT": "60",
+        "ESP32_BRIDGE_TIMEOUT": "8",
     }
 
     appended: list[str] = []
@@ -105,16 +126,215 @@ def ensure_environment_file(project_root: Path = PROJECT_ROOT) -> dict[str, str]
     return values
 
 
+def update_environment_values(
+    updates: dict[str, str],
+    project_root: Path = PROJECT_ROOT,
+) -> dict[str, str]:
+    env_path = project_root / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    remaining = dict(updates)
+    output: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in remaining:
+            output.append(f"{key}={remaining.pop(key)}")
+        else:
+            output.append(line)
+    if output and remaining:
+        output.append("")
+    output.extend(f"{key}={value}" for key, value in remaining.items())
+    env_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    return parse_env(env_path.read_text(encoding="utf-8").splitlines())
+
+
+def certificate_is_valid(path: Path, minimum_seconds: int = 30 * 24 * 60 * 60) -> bool:
+    if not path.exists():
+        return False
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        return False
+    result = subprocess.run(
+        [openssl, "x509", "-checkend", str(minimum_seconds), "-noout", "-in", str(path)],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def ensure_local_tls(
+    project_root: Path = PROJECT_ROOT,
+    tls_dir: Path | None = None,
+) -> dict[str, Path]:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        raise RuntimeError("OpenSSL is required to create the local HTTPS certificate")
+
+    directory = tls_dir or project_root / ".local" / "tls"
+    directory.mkdir(parents=True, exist_ok=True)
+    ca_cert = directory / "local-ca.pem"
+    ca_key = directory / "local-ca-key.pem"
+    server_cert = directory / "localhost.pem"
+    server_key = directory / "localhost-key.pem"
+    server_csr = directory / "localhost.csr"
+    extensions = directory / "localhost.ext"
+
+    ca_ready = ca_key.exists() and certificate_is_valid(ca_cert, 90 * 24 * 60 * 60)
+    if not ca_ready:
+        for path in (ca_cert, ca_key, server_cert, server_key, server_csr):
+            path.unlink(missing_ok=True)
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-new",
+                "-nodes",
+                "-newkey",
+                "rsa:3072",
+                "-sha256",
+                "-days",
+                "3650",
+                "-keyout",
+                str(ca_key),
+                "-out",
+                str(ca_cert),
+                "-subj",
+                "/CN=Bluetooth Scanner Local CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE,pathlen:0",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
+                "-addext",
+                "subjectKeyIdentifier=hash",
+            ],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    server_ready = server_key.exists() and certificate_is_valid(server_cert)
+    if not server_ready:
+        server_cert.unlink(missing_ok=True)
+        server_key.unlink(missing_ok=True)
+        server_csr.unlink(missing_ok=True)
+        extensions.write_text(
+            "\n".join(
+                [
+                    "authorityKeyIdentifier=keyid,issuer",
+                    "basicConstraints=critical,CA:FALSE",
+                    "keyUsage=critical,digitalSignature,keyEncipherment",
+                    "extendedKeyUsage=serverAuth",
+                    "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1",
+                    "",
+                ]
+            ),
+            encoding="ascii",
+        )
+        try:
+            subprocess.run(
+                [
+                    openssl,
+                    "req",
+                    "-new",
+                    "-nodes",
+                    "-newkey",
+                    "rsa:2048",
+                    "-keyout",
+                    str(server_key),
+                    "-out",
+                    str(server_csr),
+                    "-subj",
+                    "/CN=localhost",
+                ],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    openssl,
+                    "x509",
+                    "-req",
+                    "-sha256",
+                    "-days",
+                    "397",
+                    "-in",
+                    str(server_csr),
+                    "-CA",
+                    str(ca_cert),
+                    "-CAkey",
+                    str(ca_key),
+                    "-set_serial",
+                    f"0x{secrets.token_hex(16)}",
+                    "-extfile",
+                    str(extensions),
+                    "-out",
+                    str(server_cert),
+                ],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            server_csr.unlink(missing_ok=True)
+            extensions.unlink(missing_ok=True)
+
+    subprocess.run(
+        [openssl, "verify", "-CAfile", str(ca_cert), str(server_cert)],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    ca_key.chmod(0o600)
+    server_key.chmod(0o600)
+    return {
+        "ca_cert": ca_cert,
+        "ca_key": ca_key,
+        "server_cert": server_cert,
+        "server_key": server_key,
+    }
+
+
+def trust_local_ca(ca_cert: Path) -> None:
+    if sys.platform != "darwin":
+        print(f"Setup: trust {ca_cert} in the browser or operating-system trust store")
+        return
+    security = shutil.which("security")
+    if security is None:
+        raise RuntimeError("macOS security tool is required to trust the local HTTPS CA")
+    keychain = Path.home() / "Library" / "Keychains" / "login.keychain-db"
+    subprocess.run(
+        [
+            security,
+            "add-trusted-cert",
+            "-r",
+            "trustRoot",
+            "-p",
+            "ssl",
+            "-k",
+            str(keychain),
+            str(ca_cert),
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+
+
 def ensure_firmware_config(scanner_id: str, project_root: Path = PROJECT_ROOT) -> Path:
     if not SCANNER_ID_PATTERN.fullmatch(scanner_id):
         raise RuntimeError(f"Invalid LOCAL_SCANNER_ID for firmware: {scanner_id!r}")
     example_path = project_root / "firmware" / "include" / "config.example.h"
     config_path = project_root / "firmware" / "include" / "config.h"
-    source = (
-        config_path.read_text(encoding="utf-8")
-        if config_path.exists()
-        else example_path.read_text(encoding="utf-8")
-    )
+    source = example_path.read_text(encoding="utf-8")
     updated, count = re.subn(
         r'^#define SCANNER_ID "[^"]+"$',
         f'#define SCANNER_ID "{scanner_id}"',
@@ -167,9 +387,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "target",
         nargs="?",
-        choices=("backend", "firmware", "flash", "all"),
+        choices=("backend", "firmware", "flash", "https", "all"),
         default="backend",
-        help="backend initializes SQLite; firmware builds; flash uploads; all initializes and uploads",
+        help="backend initializes SQLite; firmware builds; flash uploads; https provisions local TLS; all runs every setup",
     )
     parser.add_argument("--port", default="auto", help="ESP32 serial port for flash, or auto")
     parser.add_argument(
@@ -184,17 +404,30 @@ def main() -> int:
     args = build_parser().parse_args()
     include_backend = args.target in {"backend", "all"}
     include_firmware = args.target in {"firmware", "flash", "all"}
+    include_https = args.target in {"https", "all"}
     upload_firmware = args.target in {"flash", "all"}
 
     executable = ensure_venv()
     values = ensure_environment_file()
-    if not args.skip_dependencies:
+    if not args.skip_dependencies and (include_backend or include_firmware):
         install_requirements(executable, include_firmware)
     elif include_firmware:
         run([str(executable), "-m", "platformio", "--version"])
 
     if include_backend:
         bootstrap_backend(executable)
+    if include_https:
+        tls = ensure_local_tls()
+        trust_local_ca(tls["ca_cert"])
+        values = update_environment_values(
+            {
+                "RUN_HTTPS": "true",
+                "RUN_TLS_CERTFILE": ".local/tls/localhost.pem",
+                "RUN_TLS_KEYFILE": ".local/tls/localhost-key.pem",
+                "RUN_TLS_CA_FILE": ".local/tls/local-ca.pem",
+            }
+        )
+        print("Setup: trusted local HTTPS for localhost and 127.0.0.1")
     if include_firmware:
         ensure_firmware_config(values["LOCAL_SCANNER_ID"])
         build_firmware(executable, upload_firmware, args.port)

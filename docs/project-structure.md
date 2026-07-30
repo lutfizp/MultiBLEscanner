@@ -18,6 +18,7 @@
 │   │   ├── models.py              SQLAlchemy tables and relationships
 │   │   ├── schemas.py             Pydantic request validation
 │   │   ├── services.py            Ingestion and application services
+│   │   ├── tracking.py            Focus leases, assignments, samples, positions, and cleanup
 │   │   ├── processing.py          Pure signal, time, and identity functions
 │   │   ├── correlation.py         Address-rotation correlation mathematics
 │   │   ├── bluetooth_ad.py        BLE AD-structure parser
@@ -32,21 +33,23 @@
 │       ├── env.py                 Runtime database URL integration
 │       └── versions/               Ordered schema revisions
 ├── dashboard/                     Non-production backend test console
-│   ├── index.html                 Inspection views and dialogs
+│   ├── index.html                 Inspection views, device drawer, and Signal Finder
 │   ├── app.css                    Test-console layout
-│   ├── app.js                     API inspection and map behavior
+│   ├── app.js                     API inspection, tracking SSE, and map behavior
 │   └── vendor/leaflet/            Locally served map runtime
 ├── firmware/
 │   ├── platformio.ini             ESP32 board and library definition
 │   ├── include/
 │   │   ├── config.example.h       Reviewed compile-time template
 │   │   └── config.h               Generated local scanner ID, ignored by Git
-│   └── src/main.cpp               NimBLE scan, queue, GATT, time, and bridge frames
+│   └── src/main.cpp               NimBLE scan, focused/GATT workers, queues, time, and bridge frames
 ├── tests/
 │   ├── test_processing.py         Signal, presence, location, and parsing behavior
 │   ├── test_correlation.py        Correlation mathematics and evidence rules
+│   ├── test_dashboard.py          Automatic test-console geolocation wiring
 │   ├── test_realtime.py           SSE shutdown and broker behavior
 │   ├── test_serial_bridge.py      Frame parsing and bridge validation
+│   ├── test_tracking.py           Focus-session isolation, leases, samples, and positions
 │   └── test_setup.py              Path-safe and non-destructive setup behavior
 ├── docs/                          Engineering and operations documentation
 ├── data/                          Default generated SQLite directory, ignored
@@ -55,11 +58,13 @@
 
 ## Ownership Boundaries
 
-The firmware owns radio capture, bounded temporary buffering, and scanner-side provenance. It does not decide logical identity, final presence, or map coordinates.
+The firmware owns radio capture, bounded temporary buffering, scanner-side provenance, and the dedicated serial transport task. It does not decide logical identity, final presence, or map coordinates.
 
 The serial bridge owns transport framing, host time synchronization, scanner authentication attachment, malformed JSON rejection, and reconnect behavior. It does not alter valid observation content.
 
 The backend owns durable state, idempotency, parsing, inference, correlation, current-state transitions, events, diagnostics, and scanner configuration.
+
+`tracking.py` owns the high-rate operator-guided measurement channel. It does not call full advertisement processing; current exact-target samples may refresh presence/RSSI for their already-linked identity but cannot create records, infer movement, run correlation, or move anchors.
 
 The `dashboard/` directory is a backend test console. It is never the source of truth, must not reproduce inference, and must not expose internal processing or calibration controls.
 

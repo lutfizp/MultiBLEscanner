@@ -31,9 +31,12 @@ Missing radio data remains missing. The backend does not synthesize names, coord
 - Authenticate scanner API requests, deduplicate retries, and persist raw observations.
 - Maintain raw radio identities separately from inferred logical devices.
 - Track scanner health, device presence, signal change, radial proximity evidence, and events.
-- Anchor a device to the scanner coordinate from its latest accepted location-changing observation.
+- Anchor a device to the latest reported scanner coordinate at its latest accepted BLE observation.
 - Keep the last anchor when a device becomes missing or offline.
-- Move the anchor only after a later accepted observation belongs to a different scanner, or when the existing anchor has no coordinates.
+- Do not move a device from scanner-position updates or heartbeats alone.
+- Move the anchor after a later accepted observation at the same moved scanner or at a different scanner.
+- Start a leased, single-target focused RSSI session only from an existing logical device and its accepted raw identities.
+- Store focus samples separately so operator-guided tracking cannot create discovery records, run correlation, infer movement, or alter durable location state; an exact current sample may refresh presence for its already-accepted identity.
 - Expose current state, history, controls, diagnostics, and location evidence through backend APIs.
 
 ### Approximate Behavior
@@ -43,11 +46,13 @@ Missing radio data remains missing. The backend does not synthesize names, coord
 - RSSI window change can support probable movement; it cannot establish direction or a path.
 - Random-address correlation can produce evidence-backed proposals. It cannot universally recover a permanent identity.
 - A device that disappears is reported as not observed or offline by timeout. The system cannot prove that Bluetooth was disabled.
+- A focused RSSI trend can guide an operator toward stronger measurements. It cannot establish a bearing or prove the target coordinate.
 
 ### Unsupported Claims
 
 - An exact device coordinate from one scanner.
 - Left, right, forward, or backward direction from one RSSI stream.
+- GPS or Bluetooth direction finding from the installed ESP32-D0WD-V3, which has neither a GPS receiver nor an AoA antenna array.
 - A permanent physical identity from a random address alone.
 - Detection of Bluetooth Classic-only devices.
 - Direct internet upload from the current firmware.
@@ -93,6 +98,7 @@ For a remote USB scanner, deploy `serial_bridge.py` on a host physically connect
 | `backend/app/models.py` | Durable relational model |
 | `backend/app/schemas.py` | Scanner and operator API request validation |
 | `backend/app/services.py` | Ingestion orchestration, state transitions, correlation, serialization, diagnostics |
+| `backend/app/tracking.py` | Focus-session leases, assignments, sample ingestion, Walk positions, state, summaries, cleanup |
 | `backend/app/processing.py` | Pure timestamp, address, RSSI, proximity, movement, and identity functions |
 | `backend/app/bluetooth_ad.py` | Raw BLE AD-structure parser |
 | `backend/app/bluetooth_sig.py` | Bluetooth SIG company lookup from local data |
@@ -119,12 +125,12 @@ This catalog identifies the supported change points. Leading-underscore function
 | `Settings.resolved_database_url` | Explicit database URL or generated SQLite URL |
 | `get_settings` | Cached environment-backed settings instance |
 | `ensure_sqlite_directory` | Creates the configured SQLite parent directory |
-| `engine_options` | Selects PostgreSQL defaults or serialized local SQLite pool options |
+| `engine_options` | Selects PostgreSQL defaults or bounded WAL-compatible SQLite pool options |
 | `get_db` | FastAPI session dependency with guaranteed close |
 
 ### HTTP Lifecycle
 
-`main.py` keeps route handlers thin. `require_scanner` parses and verifies bearer credentials. `refresh_runtime_state_once` and `refresh_runtime_states` own periodic device/scanner timeout evaluation. Route functions delegate to services: `register`, `heartbeat`, `scanner_config`, `observations_batch`, `api_overview`, `api_devices`, `api_device_detail`, `api_manual_correlation`, `api_scanners`, `api_patch_scanner`, `api_events`, `api_settings`, `api_patch_settings`, `api_diagnostics`, and `live_events`.
+`main.py` keeps route handlers thin. `require_scanner` parses and verifies bearer credentials. `refresh_runtime_state_once` and `refresh_runtime_states` own periodic device/scanner timeout evaluation. Route functions delegate to services and `tracking.py`. Every handler that uses synchronous SQLAlchemy is a synchronous FastAPI endpoint and therefore runs in the worker pool; asynchronous handlers are reserved for lifecycle and SSE. SSE publication from mutation routes is scheduled after the database response through `BackgroundTasks`, so a connection wait cannot block the asyncio event loop.
 
 Business rules must remain in service or processing modules so HTTP and future transports behave consistently.
 
@@ -142,6 +148,7 @@ Business rules must remain in service or processing modules so HTTP and future t
 | `serialize_scanner` | Produces a secret-free scanner API record |
 | `list_scanners` | Returns serialized scanners in display order |
 | `patch_scanner` | Applies operator installation fields and increments configuration version |
+| `record_scanner_position` | Applies only newer browser position fixes with timestamp/accuracy provenance and no configuration-version change |
 
 ### Observation Services
 
@@ -169,7 +176,8 @@ Business rules must remain in service or processing modules so HTTP and future t
 | `_identity_token_evidence` | Extracts approved scoped token hashes from observations |
 | `_record_identity_correlation` | Persists proposal or accepted evidence |
 | `_merge_accepted_identity_correlation` | Moves accepted identity history into the canonical logical record |
-| `run_identity_correlation` | Executes token carryover and optional RSSI-time review assignment |
+| `run_apple_continuity_correlation` | Creates non-automatic Apple address-transition proposals from bounded protocol evidence |
+| `run_identity_correlation` | Executes Apple proposals, token carryover, and optional RSSI-time review assignment |
 | `apply_manual_correlation` | Audits merge, split, known, ignored, and unignore actions |
 
 ### Current-State And Query Services
@@ -186,12 +194,29 @@ Business rules must remain in service or processing modules so HTTP and future t
 | `serialize_event` | Produces event timeline records |
 | `serialize_identity_correlation` | Produces auditable proposal/acceptance evidence |
 | `overview` | Calculates scanner/device API metrics and recent activity |
-| `list_devices` | Applies status/scanner/ignored/expired filters and serializes current devices |
+| `list_devices` | Applies status/scanner/ignored/expired/transient filters and serializes current devices |
 | `device_detail` | Loads bounded identity, observation, location, event, correlation, and enrichment history |
 | `list_events` | Filters and bounds event history |
 | `get_settings_values` | Returns settings with descriptions and update time |
 | `patch_settings` | Stores setting values; consumers remain responsible for semantic bounds |
 | `diagnostics` | Returns safe health, volume, identity, heartbeat, and processing-error summaries |
+
+### Focused Tracking Services
+
+| Function | Responsibility |
+| --- | --- |
+| `start_tracking_session` | Validates a real stored observation, assigns its latest scanner, snapshots coordinates, resolves accepted targets, and creates or idempotently renews a lease |
+| `get_tracking_session` | Serializes session state with bounded sample and Walk-position history |
+| `renew_tracking_lease` | Extends an active lease without changing target ownership |
+| `stop_tracking_session` | Releases assignments, writes a measured-sample summary, and emits an audited terminal event |
+| `tracking_focus_for_scanner` | Produces the short-lived firmware target configuration |
+| `refresh_tracking_targets_for_scanner` | Refreshes only identities already accepted into the logical device |
+| `record_tracking_heartbeat` | Reconciles firmware focus state with the scanner assignment |
+| `ingest_tracking_samples` | Enforces exact targets, sequence/freshness, idempotency, EMA, accepted-identity presence refresh, dedicated persistence, and terminal-session acknowledgement of already in-flight batches |
+| `record_tracking_position` | Stores idempotent browser geolocation evidence for Walk mode without patching scanner/device coordinates |
+| `refresh_tracking_states` | Expires leases and classifies scanner-offline or stale sessions |
+| `cleanup_tracking_history` | Deletes old focus samples/positions and terminal sessions in bounded batches |
+| `TopicRealtimeBroker` | Isolates best-effort SSE queues by tracking-session ID |
 
 ### Pure Processing And Parsing
 
@@ -214,6 +239,7 @@ Business rules must remain in service or processing modules so HTTP and future t
 | `company_identifier_from_manufacturer_data`, `company_name_from_manufacturer_data`, `company_identifier_hex` | Company ID extraction and display from manufacturer AD bytes |
 | `analyze_manufacturer_data` | Evidence-scoped manufacturer payload interpretation |
 | `infer_device_category` | Conservative service/name/payload category inference |
+| `parse_apple_continuity_messages` | Parses one-or-more Apple Continuity TLVs and hashes persistent correlation fields |
 | `parse_find_my_payload`, `parse_airdrop_payload` | Recognizes supported Apple payload layouts |
 
 ### Correlation Mathematics
@@ -268,7 +294,7 @@ POST
 |||BRIDGE_END|||
 ```
 
-The bridge accepts only supported methods and scanner paths, parses JSON before forwarding, rejects semantically empty observation batches, adds `Authorization: Bearer <token>`, and sends the backend result to the firmware.
+The bridge accepts only supported methods and scanner paths, including the dedicated tracking-sample path. It parses JSON before forwarding, rejects semantically empty normal or tracking batches, adds `Authorization: Bearer <token>`, and sends the backend result to the firmware.
 
 Control records use line prefixes:
 
@@ -278,17 +304,23 @@ Control records use line prefixes:
 | `@@BT_SCANNER_ACK@@` | host to ESP32 | backend HTTP status for queue acknowledgement |
 | `@@BT_SCANNER_CONFIG@@` | host to ESP32 | current runtime scanner configuration |
 
-The serial parser is chunk-based and tolerates partial UTF-8 input. A disconnect closes the current port and retries discovery. On macOS, CP2102 hardware normally appears as `/dev/cu.usbserial-*`; `ESP32_SERIAL_PORT=auto` selects a compatible port.
+The serial parser is chunk-based and tolerates UTF-8 sequences split across reads. A line containing invalid UTF-8 marks the complete request frame as corrupt; the bridge acknowledges it as non-success without forwarding it, so firmware retries the same stable batch. Advertisement names are validated as UTF-8 before serialization while their raw AD bytes remain preserved. A disconnect closes the current port and retries discovery. On macOS, CP2102 hardware normally appears as `/dev/cu.usbserial-*`; `ESP32_SERIAL_PORT=auto` selects a compatible port.
+
+The local backend forwarding deadline is 8 seconds. Firmware waits up to 12 seconds for the resulting serial ACK, leaving time for the bridge to report a failed request. That wait occurs only in the dedicated transport task and cannot pause BLE scanning. A failed observation upload remains an immutable retry batch. Timeout counters, last request path/status, and request duration are reported in heartbeat health for diagnosis.
 
 ## Firmware Behavior
 
-The current firmware uses NimBLE active scanning. It stores advertisement and scan-response bytes separately, reports address type and advertising metadata, and sends at most 12 observations in one serial frame to keep JSON allocation bounded during NimBLE and GATT activity.
+Firmware `esp32-ble-scanner-1.5.0` targets the detected ESP32-D0WD-V3 and uses the exact NimBLE-Arduino 2.5.0 dependency. It uses active scanning, stores advertisement and scan-response bytes separately, reports address type and advertising metadata, captures down to the practical `-110 dBm` receiver floor, and sends at most 12 observations in one serial frame to keep JSON allocation bounded during NimBLE and GATT activity.
 
-Observations are queued in a fixed-size RAM ring. When full, the oldest record is removed and `dropped_observations` is incremented. A batch remains pending until a successful backend acknowledgement; retries reuse identifiers. Queue contents do not survive reset or power loss, so the current implementation meets temporary host-disconnection buffering but not durable offline storage.
+Observations are queued in a fixed-size RAM ring. The transport task moves the oldest bounded slice into a separate immutable pending batch before serialization. When the ring is full, the incoming observation is dropped and `dropped_observations` is incremented; queued retry order is never rewritten. Retries reuse identifiers. Queue contents do not survive reset or power loss, so the current implementation meets temporary host-disconnection buffering but not durable offline storage.
 
-One eligible connectable target is queued for GATT enrichment per scan cycle. Reads are limited by what the peripheral exposes without pairing. Connection failure, service-discovery failure, and security requirements are explicit statuses rather than missing-value substitutions.
+One eligible connectable target is queued for GATT enrichment per scan cycle. At most one FreeRTOS GATT worker exists, and it never owns the Arduino loop. The source observation remains in the normal RAM queue until the worker completes or the 15-second pipeline deadline is applied. Service discovery may continue inside the worker until NimBLE releases its host procedure. The transport task independently owns configuration polling, heartbeat, serial framing, acknowledgements, and retries; a normal batch is staged only after the current scan/GATT source is safe to release.
 
-Runtime scanner configuration is pulled through the bridge. Compile-time firmware configuration contains the scanner ID and hardware-safe constants only. The scanner token stays on the bridge host.
+Characteristic values are read through the NimBLE host API without calling its automatic security retry, so firmware never initiates pairing. Protected values produce `security_required`; connection and service-discovery failures remain distinct. A deadline produces `operation_timeout`, and focused tracking produces `cancelled` with `tracking_focus_started`. These terminal results contain no invented identity values. The worker reads at most 512 bytes per supported standard identity characteristic because that is also the backend's validated per-value limit.
+
+Runtime scanner configuration is pulled through the bridge and staged for the main loop, avoiding concurrent mutation of target strings. An active `tracking_focus` assignment cancels any active GATT worker, switches NimBLE to continuous duplicate-enabled active scanning, and compares each callback against exact normalized address/address-type targets. A dedicated 64-sample ring accepts at most one target sample every 200 ms and uploads immutable retry batches every 500 ms. Normal discovery continues with cycle-level software deduplication, while new GATT enrichment remains paused. A focus acknowledgement advances only the immutable in-flight batch, preventing callbacks from corrupting queue ownership.
+
+Compile-time firmware configuration contains the scanner ID and hardware-safe constants only. The scanner token stays on the bridge host.
 
 ## Observation Contract And Ingestion
 
@@ -320,7 +352,7 @@ USB-synchronized data is trusted only when it contains `observed_at`, `boot_id`,
 
 ## Raw And Processed Data
 
-`ObservedIdentity` and `Observation` preserve scanner evidence. `LogicalDevice`, `DeviceLocationEstimate`, and `DeviceEvent` contain processed state. Updating a device status never overwrites historical observations.
+`ObservedIdentity` and `Observation` preserve normal scanner evidence. `LogicalDevice`, `DeviceLocationEstimate`, and `DeviceEvent` contain processed state. `DeviceTrackingSample` and `DeviceTrackingPosition` preserve temporary focused-measurement evidence in a separate channel. Updating a device status never overwrites historical observations. Focus samples never enter full advertisement processing, but an in-order sample for an exact assigned identity updates its observed/logical `last_seen_at`, RSSI, count, and return/active presence state without moving the location anchor.
 
 Raw AD parsing uses length/type/value structures from both payloads. Recognized structures include flags, names, service UUIDs, service data, Tx Power, appearance, connection interval, target addresses, advertising interval, and manufacturer-specific data. Unknown structures remain in parse provenance. Duplicate or conflicting structures produce parse notes rather than invented resolution.
 
@@ -336,6 +368,8 @@ Public/static identities can be tracked more directly. Random/private addresses 
 - An RSSI-time assignment is promoted under a deployment policy validated with local labelled data.
 - An operator manually merges records.
 
+Apple Continuity data adds a proposal-only path. The backend parses concatenated Continuity TLVs and evaluates short-lived authentication-tag carryover, Handoff IV sequence continuity, scoped hashed protocol tokens, subtype overlap, transition time, RSSI continuity, GATT model, and Proximity Pairing model code. It examines only a new random identity and same-scanner predecessors inside 30 seconds. The result always remains `proposal`, includes candidate ambiguity, and cannot merge or move a record.
+
 Names, ordinary service UUID sets, manufacturer company IDs, similar RSSI, and location alone are insufficient for automatic identity carryover. Statistical correlation is a review proposal by default. It does not move a location or suppress a record until accepted.
 
 The Akiyama-style assignment uses time gap and regression residual cost with explicit unmatched candidates. This avoids forcing every rotating address into a predecessor. Settings define its search window and evidence thresholds, not a universal identity guarantee.
@@ -344,7 +378,9 @@ Manual actions are audited in `manual_device_correlation_decisions` and produce 
 
 ## Presence And Offline Records
 
-Presence applies to logical devices with a trackable identity basis. Unresolved rotating addresses are not counted as confirmed physical devices indefinitely; they age to `identity_expired` and are hidden by default from the main list.
+Presence applies to logical devices with a trackable identity basis. Unresolved rotating addresses are not counted as confirmed physical devices indefinitely; they age to `identity_expired`. The Devices and Location views explicitly request `include_transient=false`. A random identity with a directly parsed Local Name remains a `named_broadcast_candidate` for display but still lacks durable presence. Manufacturer-only random traffic remains in the opt-in transient stream for radio analysis.
+
+The overview exposes both `present_ble_records` and identity-qualified counts. The first reports current logical BLE records, including unresolved randomized identities. It is an observation-state metric rather than a claim about unique physical-device count. `active_devices` remains limited to trackable identity bases, while `active_unresolved_identities` shows the unresolved remainder.
 
 Configured timers produce cautious state transitions:
 
@@ -364,13 +400,15 @@ The map coordinate is the scanner coordinate captured for the device's current a
 The anchor update policy is chronological:
 
 - A first accepted observation stores the scanner ID, zone, coordinates, and `location_anchor_observed_at`.
-- Later observations from the same scanner update signal evidence but do not drag an existing coordinate when the scanner coordinate is edited or the scanner is moved.
+- Editing or live-updating a scanner coordinate alone does not alter an existing device.
+- A later accepted observation from the same scanner snapshots that scanner's latest reported coordinate.
 - A later accepted observation from a different scanner moves the anchor to that scanner's coordinate.
 - An older delayed observation cannot rewind the anchor.
 - Missing and offline transitions do not change the anchor.
+- Heartbeats never alter the anchor.
 - Accepted identity carryover can move the canonical logical device; a correlation proposal cannot.
 
-This supports the intended Tebet-to-Bekasi flow while retaining the Tebet observation and location history.
+This supports both a moved portable scanner and the intended Tebet-to-Bekasi multi-scanner flow while retaining chronological history. A browser-derived coordinate also retains its source timestamp and accuracy. If the last browser fix is no longer fresh, the coordinate remains explicit last-reported evidence instead of becoming a fabricated replacement.
 
 ### Signal And Distance
 
@@ -390,17 +428,40 @@ Movement evidence compares two chronological five-reading RSSI windows per scann
 
 RSSI change may be caused by the transmitter, scanner, people, doors, obstruction, orientation, or multipath. The state is therefore not labelled confirmed physical movement. Direction and route require additional sensors or multiple fixed scanners with validated geometry.
 
+### Focused Signal Finder
+
+A focus session is an operator-guided measurement workflow, not a new location solver.
+
+1. The operator selects a logical device that has at least one real stored observation.
+2. The backend selects the scanner from the latest observation and resolves only raw identities already accepted into that logical device.
+3. A 30-second renewable lease is stored and the scanner configuration version is advanced.
+4. Firmware polls configuration, arms continuous active scanning, and sends dedicated samples for exact target pairs.
+5. The backend rejects unrelated addresses, deduplicates stable sample IDs, marks stale/out-of-order samples as delayed, applies an EMA only to chronological samples, and publishes fresh samples on topic-isolated SSE.
+6. Stop or lease expiry disarms the scanner and stores a summary from measured samples.
+
+One scanner can have one active focus assignment. Repeating Start for the same device renews the existing session; a different target conflicts. Address rotation is not inferred during focus. An already accepted new identity can enter the target list through normal correlation processing, but RSSI similarity never adds it.
+
+A batch may already be in USB transit when Stop commits. If its scanner is the session's assigned scanner, the backend returns HTTP 200 with those samples counted as `discarded`; it does not insert them after the terminal state. This acknowledgement lets firmware release the immutable retry batch while configuration refresh removes focus mode.
+
+Fixed mode uses the scanner-coordinate snapshot stored on the assignment. It does not update if an operator later edits scanner installation coordinates. Walk mode stores browser geolocation with each measurement segment. The browser must be physically co-located with the moving scanner; otherwise the coordinates describe the browser, not the ESP32. Neither mode patches `scanners`, `logical_devices`, or normal `device_location_estimates`.
+
+The backend signal level linearly maps EMA RSSI from `-85 dBm` to zero and `-45 dBm` to one, clamped outside that interval. It exists only to drive the relative meter and audio feedback. Trend text compares the medians of two consecutive five-sample windows and requires at least a 3 dB difference. These display transformations do not estimate bearing.
+
 ## Database Model
 
 | Table | Purpose | Important integrity rule |
 | --- | --- | --- |
 | `monitored_locations` | Reusable building, floor, room, zone, and coordinates | Stable location identifier |
-| `scanners` | Persistent scanner identity, installation, location, health state | Unique hardware ID; token stored as hash |
+| `scanners` | Persistent scanner identity, installation, current position provenance, and health state | Unique hardware ID; token stored as hash |
 | `scanner_configurations` | Versioned current scan/upload thresholds | One current row per scanner |
 | `scanner_heartbeats` | Immutable health samples | Unique scanner/message ID |
 | `observed_identities` | Raw BLE identity and latest direct fields | Indexed address/type and fingerprint |
 | `logical_devices` | Current operator-facing state and durable anchor | Indexed status, last seen, primary address |
 | `observations` | Immutable received BLE samples | Unique scanner/batch/item and time indexes |
+| `device_tracking_sessions` | Leased operator-guided measurement lifecycle and terminal summary | Device/start and state/expiry indexes |
+| `device_tracking_scanners` | Scanner assignment, target identities, fixed coordinate snapshot, focus state | Unique session/scanner |
+| `device_tracking_samples` | High-rate accepted RSSI samples outside normal processing | Unique scanner/sample; session/time and assignment/sequence indexes |
+| `device_tracking_positions` | Browser geolocation evidence for Walk sessions | Unique session/position; session/time index |
 | `device_enrichments` | Direct GATT read results | Unique scanner/source observation/transport |
 | `device_location_estimates` | Chronological signal/radial evidence | Device/time index |
 | `device_events` | Device and scanner transitions | Unique dedupe key |
@@ -413,11 +474,11 @@ Schema changes require a new Alembic revision, updated ORM model, updated schema
 
 ## SQLite And PostgreSQL
 
-SQLite is the supported single-host default. The engine creates the database parent directory, enables foreign keys, WAL journal mode, a 30-second busy timeout, normal synchronous mode, and one pooled application connection. The process lock prevents two `run.py` writers. External SQLite writers can still cause lock contention and should not be used during scanning.
+SQLite is the supported single-host default. The engine creates the database parent directory, enables foreign keys, WAL journal mode, a 30-second busy timeout, normal synchronous mode, and a bounded four-connection pool with no overflow. WAL allows dashboard readers to complete while short scanner writes are active. Synchronous SQLAlchemy work never runs directly on the asyncio event loop. The process lock prevents two `run.py` writers. External SQLite writers can still cause lock contention and should not be used during scanning.
 
 PostgreSQL is the deployment path for multiple bridge hosts, concurrent operators, or sustained write volume. Set `DATABASE_URL`, apply migrations once during deployment, and run a single maintenance scheduler unless the background task is moved to a coordinated worker. Multiple Uvicorn workers currently duplicate the periodic maintenance loop, although event dedupe protects many transitions; use one worker until scheduler ownership is separated.
 
-Retention values are stored and exposed as settings, but there is currently no automatic retention worker. Database growth must be monitored and cleanup must not be advertised as active until a tested archival/deletion job is implemented. Any cleanup must preserve events, identity decisions, and required summaries while deleting raw observations in bounded transactions.
+Normal observation retention values are stored and exposed as settings, but there is currently no automatic normal-observation deletion worker. Focus tracking has a narrow hourly cleanup: samples and Walk positions older than raw retention, plus terminal sessions older than summary retention, are removed in batches of at most 1,000 rows. Database growth must still be monitored. Any broader cleanup must preserve events, identity decisions, and required summaries while deleting raw observations in bounded transactions.
 
 ## API And Security
 
@@ -431,7 +492,7 @@ The API contract is documented in `docs/api.md`. HTTP 401 indicates missing or i
 
 The backend's durable client contract is REST plus server-sent event notifications. SSE tells clients to refresh; it does not replace database state or response schemas.
 
-`RealtimeBroker` is in-process and best effort. Each subscriber has a queue of 100 messages; stale/slow subscribers can lose older UI notifications and recover through normal HTTP refresh. SSE is not the source of durable state. The database is authoritative.
+`RealtimeBroker` is in-process and best effort. Each general subscriber has a queue of 100 messages; stale/slow subscribers can lose older UI notifications and recover through normal HTTP refresh. `TopicRealtimeBroker` uses a separate bounded queue per tracking-session subscriber so high-rate target samples are not broadcast to unrelated clients. SSE is not the source of durable state. The database is authoritative.
 
 The bundled `dashboard/` client is retained only for backend and hardware testing. It must not acquire business rules, duplicate inference, expose internal tuning controls, or be treated as a production frontend. A future production client must consume the documented API and implement its own authentication and authorization boundary.
 
@@ -466,6 +527,8 @@ Classifiers belong in `device_intelligence.py`. They must consume direct adverti
 
 Implement a new method alongside existing estimates. Store method name, input scanner IDs, timestamps, model parameters, confidence/uncertainty region, and validation state. Never overwrite the raw per-scanner observations. Require at least the anchor count and geometry expected by the method, and return no coordinate when the constraints are not met.
 
+Focused tracking samples may be consumed as measurement evidence only when their scanner assignment, target identity, timestamp order, and position provenance satisfy the new method. Do not promote the strongest Walk sample into a logical-device coordinate. A solver needs an independently validated model and must write a distinct estimate with uncertainty.
+
 ### Adding A Transport
 
 Keep the scanner-facing HTTP contract and idempotency identifiers stable. A network firmware or gateway should implement bounded storage, retry with backoff, acknowledgement, clock provenance, token protection, and duplicate-safe replay. The backend must not depend on scanners sharing a LAN.
@@ -483,7 +546,8 @@ Every change should select tests by risk:
 - Parsing changes: valid, truncated, duplicate, unknown, and conflicting AD structures.
 - Timestamp changes: stale sync, future skew, reset, delayed batch, and out-of-order observation.
 - Identity changes: public address, random address, unmatched assignment, proposal, accepted token, manual merge, and false-match protection.
-- Location changes: first anchor, same-scanner edit, different-scanner move, offline preservation, and delayed no-rewind.
+- Location changes: first anchor, scanner-update isolation, same-scanner re-observation, different-scanner move, stale-fix provenance, offline preservation, and delayed no-rewind.
+- Focus tracking changes: real-observation requirement, exact target enforcement, one assignment per scanner, idempotent start/sample/position behavior, lease expiry, stale sequence handling, presence refresh, and location-anchor isolation.
 - Database changes: fresh migration, upgrade migration, constraints, duplicate retry, rollback, and SQLite lock behavior.
 - Firmware changes: PlatformIO build plus real hardware serial, scan, queue, retry, reconnect, time-sync, and payload validation.
 - Test-console changes: JavaScript syntax and a narrow smoke check against real backend responses; console behavior is outside backend acceptance.
@@ -500,10 +564,14 @@ The following conditions must remain true after any change:
 - A random address is not treated as a permanent physical identity.
 - A correlation proposal does not merge records or move an anchor.
 - Offline state does not move a device coordinate.
-- Same-scanner observations do not drag an established coordinate.
+- Scanner-position updates and heartbeats do not move a device without a BLE observation.
+- A newer same-scanner BLE observation snapshots that scanner's latest reported coordinate.
 - Delayed observations do not rewind current state.
 - SIG company attribution comes from payload company ID, not random MAC prefix.
 - One-scanner RSSI never produces a bearing or exact point.
+- Focus samples can originate only from accepted raw identities of a stored logical device.
+- Focus samples may refresh presence only for an exact already-linked identity; they never create identities, infer movement, run correlation, change scanner installation coordinates, or move durable device anchors.
+- A stale browser cannot hold focus indefinitely; every active session has a bounded renewable lease.
 - Scanner secrets never appear in operator or diagnostics responses.
 - Setup never inserts fake observations and never deletes an existing database implicitly.
 
@@ -517,5 +585,6 @@ The following conditions must remain true after any change:
 - The in-process SSE broker does not distribute events across multiple backend processes.
 - Multi-scanner coordinate estimation and floor-plan solving are not implemented.
 - Scanner configuration editing currently covers only fields exposed by the backend API, not every firmware constant.
+- Walk positions rely on browser geolocation and physical co-location with the scanner; the ESP32-D0WD-V3 does not measure its own position.
 
 These gaps must be treated as explicit backlog items rather than capabilities implied by the schema.

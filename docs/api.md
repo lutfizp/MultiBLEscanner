@@ -32,7 +32,10 @@ This route does not prove scanner or database freshness. Use diagnostics and sca
 Returns safe browser runtime values:
 
 ```json
-{"app_timezone": "Asia/Jakarta"}
+{
+  "app_timezone": "Asia/Jakarta",
+  "local_scanner_id": "scn_dev_lab_001"
+}
 ```
 
 Secrets and database configuration are excluded.
@@ -53,8 +56,8 @@ Request:
 {
   "hardware_id": "usb-esp32-002",
   "display_name": "Bekasi Scanner",
-  "firmware_version": "esp32-ble-scanner-1.3.1",
-  "hardware_version": "esp32dev",
+  "firmware_version": "esp32-ble-scanner-1.5.0",
+  "hardware_version": "esp32-d0wd-v3",
   "installation_name": "bekasi-gateway"
 }
 ```
@@ -73,7 +76,7 @@ Response:
     "scan_interval_ms": 5000,
     "upload_interval_seconds": 5,
     "batch_size": 40,
-    "rssi_min": -85,
+    "rssi_min": -110,
     "presence_missing_seconds": 45,
     "presence_offline_seconds": 180,
     "extra": {}
@@ -82,6 +85,7 @@ Response:
 ```
 
 Store the token on the bridge host. Registration does not create observations or make the scanner online.
+`rssi_min=-110` is the practical firmware capture floor. Operator-facing visibility is controlled separately by identity evidence and the `include_transient` query flag.
 
 ## Scanner Runtime Endpoints
 
@@ -94,9 +98,25 @@ Records one immutable health sample and updates current scanner state. `message_
   "message_id": "hb-boot-id-104",
   "scanner_time": "2026-07-15T08:10:00.000Z",
   "uptime_seconds": 683,
-  "firmware_version": "esp32-ble-scanner-1.3.1",
+  "firmware_version": "esp32-ble-scanner-1.5.0",
+  "hardware_version": "esp32-d0wd-v3",
   "network_state": {"transport": "usb_serial", "connected": true},
-  "health": {"free_heap": 132448, "boot_id": "boot-a9c2"},
+  "health": {
+    "free_heap": 132448,
+    "boot_id": "boot-a9c2",
+    "tracking_session_id": "",
+    "tracking_state": "inactive",
+    "gatt_worker_state": "idle",
+    "gatt_worker_age_ms": 0,
+    "pending_tracking_samples": 0,
+    "dropped_tracking_samples": 0,
+    "transport_request_sequence": 104,
+    "transport_last_path": "/api/scanners/scn_dev_lab_001/config",
+    "transport_last_status": 200,
+    "transport_last_duration_ms": 41,
+    "transport_timeout_count": 0,
+    "transport_failure_count": 0
+  },
   "buffer_usage": 8,
   "pending_observations": 8,
   "dropped_observations": 0,
@@ -110,6 +130,29 @@ Unknown fields are rejected. Counters must be non-negative. The response reports
 ### `GET /api/scanners/{scanner_id}/config`
 
 Returns the current runtime configuration for the authenticated scanner. The USB bridge forwards this response to firmware with `@@BT_SCANNER_CONFIG@@`.
+
+When the scanner has an active assignment, the response also contains:
+
+```json
+{
+  "tracking_focus": {
+    "session_id": "tracking-session-uuid",
+    "mode": "fixed",
+    "expires_at": "2026-07-29T07:20:29.629736Z",
+    "sample_interval_ms": 200,
+    "upload_interval_ms": 500,
+    "target_identities": [
+      {
+        "observed_identity_id": "identity-uuid",
+        "address": "80:e1:26:9e:3e:e3",
+        "address_type": "public"
+      }
+    ]
+  }
+}
+```
+
+`tracking_focus` is absent when no live lease is assigned. The target list contains only raw identities already associated with the selected logical device.
 
 ### `POST /api/scanners/{scanner_id}/observations/batch`
 
@@ -190,14 +233,105 @@ The service returns accepted, duplicate, ignored, and failed item counts plus it
 - `connection_failed`
 - `service_discovery_failed`
 - `security_required`
+- `operation_timeout`
+- `cancelled`
 
-Direct fields include device name, manufacturer, model, serial, firmware/hardware/software revisions, System ID, PnP ID, discovered services, and raw characteristic values. Binary values are lowercase hexadecimal after validation. At most 64 characteristic values and 128 discovered services are accepted. Absence does not imply an empty or unknown value was read.
+`operation_timeout` means the scanner released the source observation after its GATT pipeline deadline. `cancelled` means an explicit scanner mode change, currently focused tracking, stopped the attempt. `security_required` records a protected characteristic without forcing pairing.
+
+Direct fields include device name, manufacturer, model, serial, firmware/hardware/software revisions, System ID, PnP ID, discovered services, and raw characteristic values. Binary values are lowercase hexadecimal after validation. At most 64 characteristic values, 512 bytes per value, and 128 discovered services are accepted. Absence does not imply an empty or unknown value was read.
+
+## Focused Tracking
+
+Focused tracking is a separate measurement channel. It requires a logical device backed by a stored BLE observation and never accepts heartbeat data as a target. Focus samples are not full advertisement observations: they do not create identities or devices, run correlation, calculate normal movement state, or change the durable location anchor. A current in-order sample for an exact assigned identity refreshes that identity and logical device's `last_seen_at`, RSSI, observation count, and cautious return/active presence state.
+
+### `POST /api/devices/{device_id}/tracking-sessions`
+
+Starts or resumes a session:
+
+```json
+{"mode": "fixed"}
+```
+
+`mode` is `fixed` or `walk`. The backend assigns the scanner from the device's latest stored observation, snapshots that scanner's current coordinates, resolves up to eight accepted address/address-type targets, and increments scanner configuration.
+
+One active session is permitted per scanner. Repeating this request for the same logical device renews and returns the existing session. A different device receives HTTP 409 until the assignment is stopped or its lease expires. Ignored devices and records without a real observation receive HTTP 400.
+
+The response contains:
+
+- session ID, logical device ID, mode, state, start/lease/expiry/end timestamps, stop reason, and summary;
+- scanner assignments, accepted target identities, fixed coordinate snapshot, sample freshness, smoothed RSSI, and dropped-sample count;
+- a 30-second `lease_seconds` value;
+- the six-second `sample_stale_seconds` value;
+- the backend signal scale and EMA coefficient.
+
+Active state values are `arming`, `waiting_for_advertisement`, `live`, `stale`, `scanner_offline`, and `identity_changed`. Terminal states are `stopped` and `expired`.
+
+### `GET /api/tracking-sessions/{session_id}`
+
+Returns the session plus at most 200 recent focused samples and 500 Walk positions in chronological order. A focused sample includes its direct RSSI, backend-smoothed RSSI, normalized zero-to-one signal level, sequence, accepted observed-identity ID, and delayed flag.
+
+### `POST /api/tracking-sessions/{session_id}/lease`
+
+Renews an active session for 30 seconds. Clients should renew before expiry and treat HTTP 409 as terminal. Lease expiry stops focus mode even when a browser closes without sending Stop.
+
+### `DELETE /api/tracking-sessions/{session_id}`
+
+Stops the session and releases all scanner assignments. Optional query parameter `reason` is limited to 120 characters. The terminal summary records sample count, minimum/maximum/median RSSI, and the strongest measured sample; a nearby Walk position is included only when its timestamp is within ten seconds of that sample.
+
+### `POST /api/tracking-sessions/{session_id}/positions`
+
+Stores browser-provided geolocation evidence for a Walk session:
+
+```json
+{
+  "position_id": "walk-unique-id",
+  "scanner_id": "scn_dev_lab_001",
+  "observed_at": "2026-07-29T07:20:00.000Z",
+  "latitude": -6.26085,
+  "longitude": 106.960005,
+  "accuracy_m": 12.4
+}
+```
+
+The scanner must be assigned to that session. Fixed sessions reject positions with HTTP 409. `position_id` is idempotent within a session. The endpoint does not patch scanner installation coordinates or logical-device anchors. The position is valid scanner-path evidence only when the browser providing geolocation remains physically co-located with the scanner.
+
+### `GET /api/tracking-sessions/{session_id}/events`
+
+Opens a topic-isolated `text/event-stream`. Event types are `tracking_sample`, `scanner_position`, and `session_state`, plus `connected` and `ping`. This stream is best effort; reconnect by reading the session resource and reopening the stream.
+
+### `POST /api/scanners/{scanner_id}/tracking-samples/batch`
+
+Scanner-authenticated endpoint for firmware focus batches:
+
+```json
+{
+  "batch_id": "focus-batch-stable-id",
+  "session_id": "tracking-session-uuid",
+  "dropped_samples": 0,
+  "samples": [
+    {
+      "sample_id": "focus-session-17",
+      "observed_at": "2026-07-29T07:20:00.200Z",
+      "boot_id": "boot-a9c2",
+      "monotonic_ms": 683200,
+      "sequence": 17,
+      "address": "80:e1:26:9e:3e:e3",
+      "address_type": "public",
+      "rssi": -67
+    }
+  ]
+}
+```
+
+A batch contains 1-64 samples. The backend accepts only exact normalized address and address-type pairs in the assignment, deduplicates `sample_id` per scanner, suppresses stale or out-of-order samples from live SSE, and still records accepted delayed samples with `delayed: true`. Current in-order samples are factual BLE presence evidence for the already-linked identity, but they do not contain a full ADV payload and never re-anchor the device. The response reports accepted, duplicate, rejected, discarded, session, and state counts.
+
+An authenticated assigned scanner can have an immutable batch already in flight when Stop or lease expiry reaches the backend. Such samples are not inserted after the terminal transition; they are acknowledged with HTTP 200 and counted as `discarded` so firmware can release the retry batch. An unknown session or unassigned scanner remains an error.
 
 ## Backend Query Endpoints
 
 ### `GET /api/overview`
 
-Returns aggregate scanner state, confirmed present-device metrics, unresolved identity counts, observation rate, system health, and recent events. Unresolved rotating identities are kept separate from physical-device counts.
+Returns aggregate scanner state, present BLE-record count, visible candidate count, trackable present-device metrics, unresolved identity counts, observation rate, system health, and recent events. `present_ble_records` counts all logical records currently in `active`, `newly_detected`, or `returned`; it must not be interpreted as a deduplicated physical-device count. `visible_device_candidates` applies the Devices/Locations admission rule, while `active_devices` remains limited to durable identity bases and `active_unresolved_identities` exposes the unresolved remainder.
 
 ### `GET /api/devices`
 
@@ -209,8 +343,9 @@ Query parameters:
 | `scanner_id` | Restricts current logical anchor scanner |
 | `include_ignored` | Includes operator-ignored logical devices |
 | `include_expired` | Includes expired unresolved random identities |
+| `include_transient` | Includes unresolved random-address broadcasts; API default is `true`, while the Devices and Location views explicitly request `false` |
 
-Default ordering is newest `last_seen_at` first. Records include identity basis, presence trackability, direct and inferred device fields, latest capture provenance, signal/radial model, anchor coordinates, and status.
+Default ordering is newest `last_seen_at` first. Records include identity basis, `visibility_class` (`device_candidate`, `named_broadcast_candidate`, or `transient_broadcast`), presence trackability, direct and inferred device fields, latest capture provenance, signal/radial model, anchor coordinates, and status. A directly captured Local Name can make a random advertiser visible without making it a durable physical identity. Hiding a transient record does not delete its raw observation.
 
 ### `GET /api/devices/{device_id}`
 
@@ -224,7 +359,7 @@ Returns:
 - up to 100 identity-correlation records;
 - up to 100 GATT enrichment records.
 
-A correlation `proposal` is review evidence only. Only accepted evidence or a manual action can alter logical ownership.
+A correlation `proposal` is review evidence only. Apple Continuity proposals include subtype, hashed transition-token, Handoff IV, time, RSSI, GATT model, candidate-count, and score-margin evidence where available. They are never automatically accepted. Only an accepted evidence policy or a manual action can alter logical ownership.
 
 ### `GET /api/scanners`
 
@@ -240,7 +375,7 @@ Returns backend policy records with value, description, and update timestamp. Th
 
 ### `GET /api/diagnostics`
 
-Returns server/database status, observation/event/error counts, identity counts, latest heartbeat counters, and up to 20 recent processing errors. It does not return secrets or full raw request bodies.
+Returns server/database status, observation/event/error counts, tracking session/sample counts, identity counts, latest heartbeat counters, and up to 20 recent processing errors. It does not return secrets or full raw request bodies.
 
 ### `GET /api/live/events`
 
@@ -252,7 +387,25 @@ Opens a `text/event-stream` connection. Messages notify clients to refresh durab
 
 Accepted fields are display name, enabled state, building, floor, room, zone, latitude, longitude, indoor coordinates, orientation, and maintenance notes. Unknown fields are rejected. A successful patch increments `config_version`.
 
-The API does not infer scanner GPS. Coordinates come from operator/browser input and should represent the scanner installation.
+Coordinates supplied through this endpoint are marked as operator-configured values. Use the live position endpoint for repeated browser fixes; do not poll this configuration endpoint with GPS updates.
+
+### `POST /api/scanners/{scanner_id}/position`
+
+Stores a directly reported current scanner position without changing firmware configuration:
+
+```json
+{
+  "observed_at": "2026-07-29T08:15:12.481Z",
+  "latitude": -6.2261,
+  "longitude": 106.8529,
+  "accuracy_m": 14.2,
+  "source": "browser_geolocation"
+}
+```
+
+`observed_at`, coordinates, accuracy, and source are required. The only accepted source is `browser_geolocation`. A timestamp more than one minute in the future is rejected with HTTP 400. An update older than or equal to the scanner's stored position timestamp returns HTTP 200 with `position_applied: false` and does not rewind the scanner.
+
+The response is the scanner representation plus `position_applied`. It includes `location_source`, `location_observed_at`, and `location_accuracy_m`. The endpoint does not increment `config_version`, create a BLE observation, alter a logical device, or create a device-location event. A logical-device anchor changes only when a newer accepted BLE observation snapshots the scanner's then-current position.
 
 ### `PATCH /api/settings`
 
@@ -293,6 +446,7 @@ Merge requires a target. Every action creates an audit record and event. Split c
 | `401` | Missing, malformed, or invalid scanner token |
 | `403` | Missing or incorrect registration secret |
 | `404` | Scanner or logical device not found |
+| `409` | Tracking lease/session state conflict or scanner already assigned |
 | `422` | JSON/schema validation failure |
 | `500` | Unhandled server/database failure |
 

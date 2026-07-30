@@ -34,6 +34,7 @@ class HeartbeatIn(BaseModel):
     scanner_time: Optional[datetime] = None
     uptime_seconds: Optional[int] = Field(default=None, ge=0)
     firmware_version: Optional[str] = Field(default=None, max_length=80)
+    hardware_version: Optional[str] = Field(default=None, max_length=80)
     network_state: dict[str, Any] = Field(default_factory=dict)
     health: dict[str, Any] = Field(default_factory=dict)
     buffer_usage: int = Field(default=0, ge=0)
@@ -51,7 +52,15 @@ class HeartbeatIn(BaseModel):
 
 
 class GATTEnrichmentIn(BaseModel):
-    status: Literal["success", "partial", "connection_failed", "service_discovery_failed", "security_required"]
+    status: Literal[
+        "success",
+        "partial",
+        "connection_failed",
+        "service_discovery_failed",
+        "security_required",
+        "operation_timeout",
+        "cancelled",
+    ]
     device_name: Optional[str] = Field(default=None, max_length=240)
     manufacturer_name: Optional[str] = Field(default=None, max_length=240)
     model_number: Optional[str] = Field(default=None, max_length=240)
@@ -199,6 +208,55 @@ class ObservationBatchIn(BaseModel):
         return self
 
 
+class TrackingSessionCreateIn(BaseModel):
+    mode: Literal["fixed", "walk"] = "fixed"
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TrackingSampleIn(BaseModel):
+    sample_id: str = Field(min_length=3, max_length=120)
+    observed_at: datetime
+    boot_id: str = Field(min_length=3, max_length=160)
+    monotonic_ms: int = Field(ge=0)
+    sequence: int = Field(ge=0)
+    address: str = Field(min_length=3, max_length=80)
+    address_type: str = Field(min_length=1, max_length=80)
+    rssi: int = Field(ge=-127, le=20)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def observed_at_is_required(cls, value: Any) -> Any:
+        return empty_datetime_to_none(value)
+
+
+class TrackingSampleBatchIn(BaseModel):
+    batch_id: str = Field(min_length=3, max_length=120)
+    session_id: str = Field(min_length=3, max_length=64)
+    samples: list[TrackingSampleIn] = Field(min_length=1, max_length=64)
+    dropped_samples: int = Field(default=0, ge=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TrackingPositionIn(BaseModel):
+    position_id: str = Field(min_length=3, max_length=120)
+    scanner_id: str = Field(min_length=3, max_length=64)
+    observed_at: datetime
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float = Field(ge=0, le=100_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def observed_at_is_required(cls, value: Any) -> Any:
+        return empty_datetime_to_none(value)
+
+
 class ScannerPatchIn(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=160)
     enabled: Optional[bool] = None
@@ -212,6 +270,45 @@ class ScannerPatchIn(BaseModel):
     indoor_y: Optional[float] = None
     orientation_deg: Optional[float] = None
     maintenance_notes: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ScannerPositionIn(BaseModel):
+    observed_at: datetime
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float = Field(ge=0, le=100_000)
+    source: Literal["browser_geolocation"] = "browser_geolocation"
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BrowserLocationDiagnosticIn(BaseModel):
+    recorded_at: datetime
+    stage: Literal[
+        "starting",
+        "waiting",
+        "insecure",
+        "unsupported",
+        "permission_denied",
+        "unavailable",
+        "timeout",
+        "fix_received",
+        "saving",
+        "live",
+        "save_error",
+        "stopped",
+    ]
+    page_origin: str = Field(max_length=300)
+    secure_context: bool
+    permission_state: str = Field(max_length=80)
+    watcher_active: bool
+    visibility_state: str = Field(max_length=40)
+    position_timestamp: Optional[datetime] = None
+    accuracy_m: Optional[float] = Field(default=None, ge=0, le=100_000)
+    error_code: Optional[int] = None
+    error_message: Optional[str] = Field(default=None, max_length=500)
 
     model_config = ConfigDict(extra="forbid")
 

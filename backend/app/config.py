@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     scanner_token_salt: str = "development-token-salt"
     dashboard_dir: str = "dashboard"
     app_timezone: str = "Asia/Jakarta"
+    local_scanner_id: str = "scn_dev_lab_001"
     heartbeat_timeout_seconds: int = 90
     presence_missing_seconds: int = 45
     presence_offline_seconds: int = 180

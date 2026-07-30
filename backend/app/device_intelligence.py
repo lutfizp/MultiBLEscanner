@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from .bluetooth_sig import (
@@ -76,6 +77,120 @@ FIND_MY_BATTERY_STATUS = {
     0xC0: "critical",
 }
 
+APPLE_CONTINUITY_MESSAGE_NAMES = {
+    0x03: "airprint",
+    0x05: "airdrop",
+    0x06: "homekit",
+    0x07: "proximity_pairing",
+    0x08: "hey_siri",
+    0x09: "airplay",
+    0x0B: "magic_switch",
+    0x0C: "handoff",
+    0x0D: "tethering_target_presence",
+    0x0E: "tethering_source_presence",
+    0x0F: "nearby_action",
+    0x10: "nearby_info",
+    0x12: "find_my",
+}
+
+
+def _evidence_hash(scope: str, value: bytes) -> str:
+    return hashlib.sha256(scope.encode("ascii") + b":" + value).hexdigest()
+
+
+def parse_apple_continuity_messages(manufacturer_bytes: bytes) -> list[dict[str, Any]]:
+    """Parse Apple company data as the published one-or-more TLV layout.
+
+    Raw bytes remain on the observation. Potentially persistent fields are
+    represented as scoped hashes so API responses do not create a second copy
+    of broadcast account/device tokens.
+    """
+    if len(manufacturer_bytes) < 4 or manufacturer_bytes[:2] != b"\x4c\x00":
+        return []
+
+    messages: list[dict[str, Any]] = []
+    offset = 2
+    while offset + 2 <= len(manufacturer_bytes):
+        message_type = manufacturer_bytes[offset]
+        declared_length = manufacturer_bytes[offset + 1]
+        offset += 2
+        available_length = min(declared_length, len(manufacturer_bytes) - offset)
+        data = manufacturer_bytes[offset : offset + available_length]
+        complete = available_length == declared_length
+        message: dict[str, Any] = {
+            "type": f"0x{message_type:02x}",
+            "name": APPLE_CONTINUITY_MESSAGE_NAMES.get(message_type, "unknown"),
+            "declared_length": declared_length,
+            "captured_length": available_length,
+            "complete": complete,
+            "payload_hash": _evidence_hash(f"apple-continuity-{message_type:02x}", data),
+        }
+
+        if complete and message_type == 0x10 and declared_length == 5:
+            message.update(
+                {
+                    "activity_level": data[0],
+                    "information": data[1],
+                    "authentication_tag_hash": _evidence_hash("apple-nearby-info-auth-tag", data[2:5]),
+                    "correlation_role": "short_lived_address_transition_evidence",
+                }
+            )
+        elif complete and message_type == 0x0C and declared_length == 14:
+            message.update(
+                {
+                    "version": data[0],
+                    "iv": int.from_bytes(data[1:3], "big"),
+                    "iv_hex": data[1:3].hex(),
+                    "authentication_tag_hash": _evidence_hash("apple-handoff-auth-tag", data[3:4]),
+                    "encrypted_payload_hash": _evidence_hash("apple-handoff-encrypted-payload", data[4:14]),
+                    "correlation_role": "monotonic_transition_evidence",
+                }
+            )
+        elif complete and message_type == 0x0D and declared_length == 4:
+            message.update(
+                {
+                    "identifier_hash": _evidence_hash("apple-tethering-target-identifier", data),
+                    "correlation_role": "rotating_account_identifier_evidence",
+                }
+            )
+        elif complete and message_type == 0x0B and declared_length >= 2:
+            message.update(
+                {
+                    "data_hash": _evidence_hash("apple-magic-switch-data", data[:2]),
+                    "correlation_role": "protocol_data_transition_evidence",
+                }
+            )
+        elif complete and message_type == 0x0F and declared_length >= 5:
+            message.update(
+                {
+                    "action_flags": data[0],
+                    "action_type": data[1],
+                    "authentication_tag_hash": _evidence_hash("apple-nearby-action-auth-tag", data[2:5]),
+                    "correlation_role": "short_lived_address_transition_evidence",
+                }
+            )
+        elif complete and message_type == 0x07 and declared_length >= 2:
+            message.update(
+                {
+                    "protocol_version": data[0],
+                    "device_model_code": f"0x{data[1]:02x}",
+                }
+            )
+        elif complete and message_type == 0x09 and declared_length >= 2:
+            message.update(
+                {
+                    "flags": data[0],
+                    "configuration_seed": data[1],
+                    "network_address_present": declared_length >= 6,
+                }
+            )
+
+        messages.append(message)
+        offset += available_length
+        if not complete:
+            break
+    return messages
+
 
 def short_uuid(uuid_value: str) -> str:
     value = uuid_value.strip().lower()
@@ -120,8 +235,18 @@ def analyze_manufacturer_data(manufacturer_data: str | None) -> dict[str, Any]:
     if not manufacturer_data:
         return profile
 
-    data = bytes.fromhex(manufacturer_data)
+    try:
+        data = bytes.fromhex(manufacturer_data)
+    except ValueError:
+        profile["parse_error"] = "invalid_hex"
+        return profile
     if company_id == 0x004C:
+        continuity_messages = parse_apple_continuity_messages(data)
+        if continuity_messages:
+            profile["continuity_messages"] = continuity_messages
+            profile["continuity_subtypes"] = sorted(
+                {message["name"] for message in continuity_messages}
+            )
         find_my = parse_find_my_payload(data)
         if find_my:
             profile["find_my"] = find_my
@@ -165,4 +290,3 @@ def parse_airdrop_payload(manufacturer_bytes: bytes) -> dict[str, Any] | None:
         "contact_hash_prefixes": contacts,
         "note": "Apple Nearby/AirDrop-style payload; not a stable physical-device identity.",
     }
-

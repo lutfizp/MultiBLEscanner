@@ -56,6 +56,9 @@ class Scanner(Base):
     zone = Column(String(120))
     latitude = Column(Float)
     longitude = Column(Float)
+    location_source = Column(String(60))
+    location_observed_at = Column(DateTime(timezone=True))
+    location_accuracy_m = Column(Float)
     indoor_x = Column(Float)
     indoor_y = Column(Float)
     orientation_deg = Column(Float)
@@ -86,7 +89,7 @@ class ScannerConfiguration(Base):
     scan_interval_ms = Column(Integer, nullable=False, default=5000)
     upload_interval_seconds = Column(Integer, nullable=False, default=5)
     batch_size = Column(Integer, nullable=False, default=40)
-    rssi_min = Column(Integer, nullable=False, default=-85)
+    rssi_min = Column(Integer, nullable=False, default=-110)
     presence_missing_seconds = Column(Integer, nullable=False, default=45)
     presence_offline_seconds = Column(Integer, nullable=False, default=180)
     extra = Column(JSON, nullable=False, default=dict)
@@ -225,9 +228,111 @@ class Observation(Base):
 
     __table_args__ = (
         UniqueConstraint("scanner_id", "batch_id", "observation_id", name="uq_observation_scanner_batch_item"),
+        Index("ix_observations_received", "server_received_at"),
+        Index("ix_observations_device_identity", "logical_device_id", "observed_identity_id"),
         Index("ix_observations_scanner_time", "scanner_id", "observed_at"),
         Index("ix_observations_device_time", "logical_device_id", "observed_at"),
         Index("ix_observations_identity_time", "observed_identity_id", "observed_at"),
+    )
+
+
+class DeviceTrackingSession(Base):
+    __tablename__ = "device_tracking_sessions"
+
+    id = Column(String(36), primary_key=True, default=uuid_str)
+    logical_device_id = Column(String(36), ForeignKey("logical_devices.id"), nullable=False)
+    mode = Column(String(20), nullable=False, default="fixed")
+    state = Column(String(40), nullable=False, default="arming")
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    last_lease_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True))
+    stop_reason = Column(String(120))
+    summary = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    logical_device = relationship("LogicalDevice")
+
+    __table_args__ = (
+        Index("ix_tracking_sessions_device_started", "logical_device_id", "started_at"),
+        Index("ix_tracking_sessions_state_expiry", "state", "expires_at"),
+    )
+
+
+class DeviceTrackingScanner(Base):
+    __tablename__ = "device_tracking_scanners"
+
+    id = Column(String(36), primary_key=True, default=uuid_str)
+    session_id = Column(String(36), ForeignKey("device_tracking_sessions.id"), nullable=False)
+    scanner_id = Column(String(64), ForeignKey("scanners.id"), nullable=False)
+    state = Column(String(40), nullable=False, default="arming")
+    target_identities = Column(JSON, nullable=False, default=list)
+    fixed_latitude = Column(Float)
+    fixed_longitude = Column(Float)
+    armed_at = Column(DateTime(timezone=True))
+    last_sample_at = Column(DateTime(timezone=True))
+    last_boot_id = Column(String(160))
+    last_sequence = Column(Integer)
+    smoothed_rssi = Column(Float)
+    dropped_samples = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    session = relationship("DeviceTrackingSession")
+    scanner = relationship("Scanner")
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "scanner_id", name="uq_tracking_scanner_session"),
+        Index("ix_tracking_scanners_scanner_state", "scanner_id", "state"),
+    )
+
+
+class DeviceTrackingSample(Base):
+    __tablename__ = "device_tracking_samples"
+
+    id = Column(String(36), primary_key=True, default=uuid_str)
+    session_id = Column(String(36), ForeignKey("device_tracking_sessions.id"), nullable=False)
+    assignment_id = Column(String(36), ForeignKey("device_tracking_scanners.id"), nullable=False)
+    scanner_id = Column(String(64), ForeignKey("scanners.id"), nullable=False)
+    observed_identity_id = Column(String(36), ForeignKey("observed_identities.id"), nullable=False)
+    batch_id = Column(String(120), nullable=False)
+    sample_id = Column(String(120), nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    server_received_at = Column(DateTime(timezone=True), nullable=False)
+    boot_id = Column(String(160), nullable=False)
+    monotonic_ms = Column(Integer, nullable=False)
+    sequence = Column(Integer, nullable=False)
+    address = Column(String(80), nullable=False)
+    address_type = Column(String(80), nullable=False)
+    rssi = Column(Integer, nullable=False)
+    smoothed_rssi = Column(Float, nullable=False)
+    signal_level = Column(Float, nullable=False)
+    delayed = Column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        UniqueConstraint("scanner_id", "sample_id", name="uq_tracking_sample_scanner_item"),
+        Index("ix_tracking_samples_session_time", "session_id", "observed_at"),
+        Index("ix_tracking_samples_assignment_sequence", "assignment_id", "sequence"),
+    )
+
+
+class DeviceTrackingPosition(Base):
+    __tablename__ = "device_tracking_positions"
+
+    id = Column(String(36), primary_key=True, default=uuid_str)
+    session_id = Column(String(36), ForeignKey("device_tracking_sessions.id"), nullable=False)
+    scanner_id = Column(String(64), ForeignKey("scanners.id"), nullable=False)
+    position_id = Column(String(120), nullable=False)
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    server_received_at = Column(DateTime(timezone=True), nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    accuracy_m = Column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "position_id", name="uq_tracking_position_session_item"),
+        Index("ix_tracking_positions_session_time", "session_id", "observed_at"),
     )
 
 

@@ -12,6 +12,10 @@ from .models import (
     DeviceEvent,
     DeviceIdentityCorrelation,
     DeviceLocationEstimate,
+    DeviceTrackingPosition,
+    DeviceTrackingSample,
+    DeviceTrackingScanner,
+    DeviceTrackingSession,
     LogicalDevice,
     ManualDeviceCorrelationDecision,
     MonitoredLocation,
@@ -71,7 +75,7 @@ def ensure_local_scanner() -> dict[str, object]:
                 longitude=None,
                 status="registered",
                 firmware_version="usb-serial",
-                hardware_version="esp32",
+                hardware_version="esp32-d0wd-v3",
             )
             db.add(scanner)
             db.flush()
@@ -103,6 +107,10 @@ def ensure_local_scanner() -> dict[str, object]:
 def clear_scan_data_in_session(db: Session) -> dict[str, int]:
     """Remove scanner runtime data without deleting scanner setup or settings."""
     deleted = {
+        "tracking_positions": db.execute(delete(DeviceTrackingPosition)).rowcount or 0,
+        "tracking_samples": db.execute(delete(DeviceTrackingSample)).rowcount or 0,
+        "tracking_scanners": db.execute(delete(DeviceTrackingScanner)).rowcount or 0,
+        "tracking_sessions": db.execute(delete(DeviceTrackingSession)).rowcount or 0,
         "identity_correlations": db.execute(delete(DeviceIdentityCorrelation)).rowcount or 0,
         "device_enrichments": db.execute(delete(DeviceEnrichment)).rowcount or 0,
         "events": db.execute(delete(DeviceEvent)).rowcount or 0,
@@ -160,6 +168,10 @@ def purge_suspicious_scan_data() -> dict[str, int]:
                 identity_ids.add(identity_id)
 
         deleted = {
+            "tracking_positions": 0,
+            "tracking_samples": 0,
+            "tracking_scanners": 0,
+            "tracking_sessions": 0,
             "device_enrichments": 0,
             "events": 0,
             "location_estimates": 0,
@@ -172,6 +184,34 @@ def purge_suspicious_scan_data() -> dict[str, int]:
         }
 
         if logical_ids:
+            tracking_session_ids = list(
+                db.execute(
+                    select(DeviceTrackingSession.id).where(
+                        DeviceTrackingSession.logical_device_id.in_(logical_ids)
+                    )
+                ).scalars()
+            )
+            if tracking_session_ids:
+                deleted["tracking_positions"] += db.execute(
+                    delete(DeviceTrackingPosition).where(
+                        DeviceTrackingPosition.session_id.in_(tracking_session_ids)
+                    )
+                ).rowcount or 0
+                deleted["tracking_samples"] += db.execute(
+                    delete(DeviceTrackingSample).where(
+                        DeviceTrackingSample.session_id.in_(tracking_session_ids)
+                    )
+                ).rowcount or 0
+                deleted["tracking_scanners"] += db.execute(
+                    delete(DeviceTrackingScanner).where(
+                        DeviceTrackingScanner.session_id.in_(tracking_session_ids)
+                    )
+                ).rowcount or 0
+                deleted["tracking_sessions"] += db.execute(
+                    delete(DeviceTrackingSession).where(
+                        DeviceTrackingSession.id.in_(tracking_session_ids)
+                    )
+                ).rowcount or 0
             deleted["device_enrichments"] += db.execute(
                 delete(DeviceEnrichment).where(DeviceEnrichment.logical_device_id.in_(logical_ids))
             ).rowcount or 0
@@ -203,6 +243,11 @@ def purge_suspicious_scan_data() -> dict[str, int]:
             ).rowcount or 0
 
         if identity_ids:
+            deleted["tracking_samples"] += db.execute(
+                delete(DeviceTrackingSample).where(
+                    DeviceTrackingSample.observed_identity_id.in_(identity_ids)
+                )
+            ).rowcount or 0
             deleted["device_enrichments"] += db.execute(
                 delete(DeviceEnrichment).where(DeviceEnrichment.observed_identity_id.in_(identity_ids))
             ).rowcount or 0

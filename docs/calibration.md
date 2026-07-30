@@ -15,7 +15,7 @@ The constants are internal literature-baseline values, not operator settings or 
 
 ## What The Map Shows
 
-The device's stored scanner-location snapshot is the centre of the estimate. The modeled distance is rendered as a radial uncertainty ring. One scanner has no bearing information, so the system does not place the device at an invented north/east/forward point. Editing or moving that same scanner does not move an established device anchor; a newer accepted observation from a different scanner identity can move it.
+The device's stored scanner-location snapshot is the centre of the estimate. The modeled distance is rendered as a radial uncertainty ring. One scanner has no bearing information, so the system does not place the device at an invented north/east/forward point. Editing or live-updating a scanner position alone does not move a device. A newer accepted BLE observation snapshots the scanner's latest reported position, whether it comes from the same moved scanner or a different scanner.
 
 For the ELKHA experiment, the reported useful range was approximately four metres in clear line-of-sight conditions. Distances outside that range still appear as model output, but the API marks them `outside_published_baseline_range`; they must not be read as accurate indoor measurements.
 
@@ -30,6 +30,20 @@ The API stores:
 
 Before ten observations are available for a scanner, the sequence metric is explicitly `window_not_ready`. The distance baseline can still produce a value from the available RSSI, but its sequence reliability remains unavailable.
 
+## Focused Tracking Scale
+
+Signal Finder uses a separate relative display scale:
+
+```text
+level = clamp((EMA_RSSI - (-85)) / ((-45) - (-85)), 0, 1)
+```
+
+The EMA coefficient is `0.35`. Firmware can produce at most one sample per accepted target every 200 ms. The backend uses a six-second freshness window because real CP2102 acceptance measurements reached the server 3.1-4.5 seconds after RF capture while normal observation traffic shared the serial link. Older or out-of-order samples remain stored but are excluded from live feedback. Trend text compares two consecutive five-sample medians and reports a change only at 3 dB or more.
+
+The `-85` and `-45 dBm` bounds control a meter and audio tone. They are not a distance calibration and do not alter the journal radial model, normal movement status, or stored location. A stronger level means only that the selected accepted identity was measured more strongly at that scanner.
+
+Fixed mode places measurements at the scanner-coordinate snapshot. Walk mode pairs measurements with browser GPS positions when the browser is physically co-located with the moving scanner. The strongest measured point is a search clue, not an estimated transmitter coordinate.
+
 ## Why This Is Still An Estimate
 
 BLE RSSI changes with transmitter power, antenna pattern, device orientation, body placement, multipath, walls, fading, and hardware. The UKS research [Inferring proximity from Bluetooth Low Energy RSSI with Unscented Kalman Smoothers](https://arxiv.org/abs/2007.05057) models RSSI sequences for this reason and describes direct RSSI proximity as problematic across devices and environments.
@@ -38,4 +52,4 @@ The ELKHA constants are therefore a reproducible baseline, not a universal physi
 
 ## Capture Floor
 
-The firmware `rssi_min` value is only a receiver capture floor. It decides which weak packets are accepted and is not part of the distance equation. The local default is `-85 dBm`, selected from the deployment audit because most accumulated rotating identities were never observed above that level. It is a coverage/noise boundary, not a universal distance claim.
+Firmware captures factual radio observations down to its practical `-110 dBm` receiver floor. RSSI is not used as the admission rule for the Devices or Location view. The backend preserves weak observations, while unresolved manufacturer-only random broadcasts are classified as transient and hidden from those views by default. A directly captured Local Name can promote display visibility without promoting durable identity. This separates RF collection from operator-facing device promotion and does not claim that any RSSI threshold proves physical identity.

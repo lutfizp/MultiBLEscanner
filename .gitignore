@@ -19,6 +19,7 @@ firmware/include/config.h
 
 # Runtime state and databases
 .bluetooth_scanner.run.lock
+.local/
 data/
 *.db
 *.db-journal

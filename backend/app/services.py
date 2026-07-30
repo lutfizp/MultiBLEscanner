@@ -3,6 +3,8 @@ from __future__ import annotations
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from math import asin, cos, radians, sin, sqrt
+from statistics import median
 from typing import Any
 
 from sqlalchemy import and_, desc, func, or_, select
@@ -25,6 +27,8 @@ from .models import (
     DeviceEvent,
     DeviceIdentityCorrelation,
     DeviceLocationEstimate,
+    DeviceTrackingSample,
+    DeviceTrackingSession,
     LogicalDevice,
     ManualDeviceCorrelationDecision,
     Observation,
@@ -61,6 +65,7 @@ from .schemas import (
     ManualCorrelationIn,
     ObservationBatchIn,
     ScannerPatchIn,
+    ScannerPositionIn,
     ScannerRegistrationIn,
     SettingsPatchIn,
 )
@@ -115,6 +120,45 @@ DEFAULT_SETTINGS: dict[str, tuple[Any, str]] = {
     ),
 }
 
+BROWSER_SCANNER_POSITION_MAX_AGE_SECONDS = 30
+LOCATION_EVENT_MIN_DISTANCE_M = 25.0
+
+
+def coordinate_distance_m(
+    first_latitude: float | None,
+    first_longitude: float | None,
+    second_latitude: float | None,
+    second_longitude: float | None,
+) -> float | None:
+    if None in (first_latitude, first_longitude, second_latitude, second_longitude):
+        return None
+    first_lat = radians(float(first_latitude))
+    second_lat = radians(float(second_latitude))
+    delta_lat = second_lat - first_lat
+    delta_lon = radians(float(second_longitude) - float(first_longitude))
+    value = (
+        sin(delta_lat / 2) ** 2
+        + cos(first_lat) * cos(second_lat) * sin(delta_lon / 2) ** 2
+    )
+    return 6_371_000.0 * 2 * asin(sqrt(min(1.0, value)))
+
+
+def scanner_position_is_current(scanner: Scanner, observed_at: datetime) -> bool:
+    if scanner.latitude is None or scanner.longitude is None:
+        return False
+    if scanner.location_source != "browser_geolocation":
+        return True
+    if scanner.location_observed_at is None:
+        return False
+    age_seconds = abs(
+        (ensure_utc(observed_at) - ensure_utc(scanner.location_observed_at)).total_seconds()
+    )
+    return age_seconds <= BROWSER_SCANNER_POSITION_MAX_AGE_SECONDS
+
+
+def scanner_position_is_available(scanner: Scanner) -> bool:
+    return scanner.latitude is not None and scanner.longitude is not None
+
 
 TRUSTED_CLOCK_SYNC_MAX_AGE_MS = 5 * 60 * 1000
 MAX_FUTURE_OBSERVATION_SKEW = timedelta(minutes=5)
@@ -167,7 +211,10 @@ def processing_settings_from_config(config: ScannerConfiguration | None, setting
     )
 
 
-def scanner_config_payload(config: ScannerConfiguration) -> dict[str, Any]:
+def scanner_config_payload(
+    config: ScannerConfiguration,
+    tracking_focus: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "version": config.version,
         "scan_interval_ms": config.scan_interval_ms,
@@ -176,6 +223,7 @@ def scanner_config_payload(config: ScannerConfiguration) -> dict[str, Any]:
         "rssi_min": config.rssi_min,
         "presence_missing_seconds": config.presence_missing_seconds,
         "presence_offline_seconds": config.presence_offline_seconds,
+        "tracking_focus": tracking_focus,
         "extra": config.extra or {},
     }
 
@@ -324,6 +372,7 @@ def record_heartbeat(db: Session, scanner: Scanner, payload: HeartbeatIn) -> dic
     scanner.last_connection_at = scanner.last_connection_at or now
     scanner.uptime_seconds = payload.uptime_seconds
     scanner.firmware_version = payload.firmware_version or scanner.firmware_version
+    scanner.hardware_version = payload.hardware_version or scanner.hardware_version
     scanner.network_info = payload.network_state
     if payload.config_version is not None:
         scanner.config_version = payload.config_version
@@ -476,6 +525,7 @@ def find_or_create_logical_device(
     signature = identity_signature(name, obs.service_uuids, obs.manufacturer_data, obs.service_data, obs.appearance)
     randomized = identity.randomized_address
     category = obs.device_category or infer_device_category(name, obs.service_uuids)
+    scanner_position_available = scanner_position_is_available(scanner)
 
     if address and not randomized:
         logical_matches = db.execute(
@@ -502,8 +552,8 @@ def find_or_create_logical_device(
         location_confidence=0.0,
         current_scanner_id=scanner.id,
         current_zone=scanner.zone or scanner.room,
-        latitude=scanner.latitude,
-        longitude=scanner.longitude,
+        latitude=scanner.latitude if scanner_position_available else None,
+        longitude=scanner.longitude if scanner_position_available else None,
         location_anchor_observed_at=observed_at,
         first_seen_at=observed_at,
         last_seen_at=observed_at,
@@ -700,12 +750,12 @@ def process_observation(
     )
     estimate_zone = scanner.zone or scanner.room
     estimate_location_confidence = location_confidence_for_proximity(proximity, scanner)
-    scanner_has_coordinates = scanner.latitude is not None and scanner.longitude is not None
-    anchor_needs_coordinates = logical.latitude is None or logical.longitude is None
+    scanner_position_available = scanner_position_is_available(scanner)
+    scanner_position_current = scanner_position_is_current(scanner, observed_at)
     updates_location_anchor = is_current_observation and (
         logical.current_scanner_id is None
         or logical.current_scanner_id != scanner.id
-        or (anchor_needs_coordinates and scanner_has_coordinates)
+        or scanner_position_available
     )
 
     if is_current_observation:
@@ -752,8 +802,8 @@ def process_observation(
         if updates_location_anchor:
             logical.current_scanner_id = scanner.id
             logical.current_zone = estimate_zone
-            logical.latitude = scanner.latitude if scanner_has_coordinates else None
-            logical.longitude = scanner.longitude if scanner_has_coordinates else None
+            logical.latitude = scanner.latitude if scanner_position_available else None
+            logical.longitude = scanner.longitude if scanner_position_available else None
             logical.location_anchor_observed_at = observed_at
         logical.proximity_band = band
         logical.estimated_distance_m = distance
@@ -775,13 +825,32 @@ def process_observation(
         )
     logical.observation_count += 1
 
-    location_changed = updates_location_anchor and previous_scanner_id is not None and (
+    anchor_changed = updates_location_anchor and previous_scanner_id is not None and (
         previous_scanner_id != logical.current_scanner_id
         or previous_zone != logical.current_zone
         or previous_latitude != logical.latitude
         or previous_longitude != logical.longitude
     )
-    if location_changed:
+    anchor_displacement_m = coordinate_distance_m(
+        previous_latitude,
+        previous_longitude,
+        logical.latitude,
+        logical.longitude,
+    )
+    meaningful_location_changed = anchor_changed and (
+        previous_scanner_id != logical.current_scanner_id
+        or previous_zone != logical.current_zone
+        or (
+            anchor_displacement_m is not None
+            and anchor_displacement_m >= LOCATION_EVENT_MIN_DISTANCE_M
+        )
+    )
+    if meaningful_location_changed:
+        location_reason = (
+            "observed_by_different_scanner"
+            if previous_scanner_id != logical.current_scanner_id
+            else "observed_after_scanner_position_changed"
+        )
         create_event(
             db,
             "device_location_changed",
@@ -792,7 +861,7 @@ def process_observation(
             previous_location=previous_zone or previous_scanner_id,
             new_location=estimate_zone or scanner.id,
             confidence=logical.location_confidence,
-            reason="observed_by_different_scanner",
+            reason=location_reason,
             details={
                 "previous_scanner_id": previous_scanner_id,
                 "current_scanner_id": logical.current_scanner_id,
@@ -804,6 +873,9 @@ def process_observation(
                 "current_anchor_longitude": logical.longitude,
                 "previous_anchor_observed_at": serialize_datetime(previous_anchor_observed_at),
                 "current_anchor_observed_at": serialize_datetime(logical.location_anchor_observed_at),
+                "anchor_displacement_m": anchor_displacement_m,
+                "scanner_location_source": scanner.location_source,
+                "scanner_location_accuracy_m": scanner.location_accuracy_m,
             },
             dedupe_key=(
                 f"device-location:{logical.id}:{previous_scanner_id or 'none'}:{scanner.id}:"
@@ -833,7 +905,7 @@ def process_observation(
             dedupe_key=f"movement:{logical.id}:{movement.status}:{observed_at.strftime('%Y%m%d%H%M')}",
         )
 
-    if is_current_observation and not location_changed and previous_band != band:
+    if is_current_observation and not meaningful_location_changed and previous_band != band:
         create_event(
             db,
             "device_location_estimate_changed",
@@ -879,7 +951,7 @@ def process_observation(
             "manufacturer_profile": manufacturer_profile,
             "proximity_model": proximity_model,
             "updates_current_location": updates_location_anchor,
-            "location_anchor_policy": "different_scanner_or_missing_anchor",
+            "location_anchor_policy": "latest_observation_with_current_scanner_position",
             "capture_provenance": capture_provenance,
             "time_provenance": time_provenance,
             "gatt_enrichment": gatt_enrichment.model_dump(mode="json") if gatt_enrichment else None,
@@ -933,6 +1005,11 @@ def process_observation(
                 "proximity_model": proximity_model,
                 "scanner_latitude": scanner.latitude,
                 "scanner_longitude": scanner.longitude,
+                "scanner_location_source": scanner.location_source,
+                "scanner_location_observed_at": serialize_datetime(scanner.location_observed_at),
+                "scanner_location_accuracy_m": scanner.location_accuracy_m,
+                "scanner_position_available": scanner_position_available,
+                "scanner_position_current": scanner_position_current,
                 "updates_current_anchor": updates_location_anchor,
                 "anchor_scanner_id": logical.current_scanner_id,
                 "anchor_latitude": logical.latitude,
@@ -942,7 +1019,13 @@ def process_observation(
     )
 
     scanner.last_seen_at = received_at
-    return True, {"duplicate": False, "logical_device_id": logical.id, "status": logical.status}
+    return True, {
+        "duplicate": False,
+        "logical_device_id": logical.id,
+        "observed_identity_id": identity.id,
+        "correlation_reason": correlation_reason,
+        "status": logical.status,
+    }
 
 
 def location_confidence_for_proximity(proximity: Any, scanner: Scanner) -> float:
@@ -1227,7 +1310,274 @@ def _merge_accepted_identity_correlation(
     )
 
 
-def run_identity_correlation(db: Session, include_statistical_review: bool = True) -> dict[str, int]:
+APPLE_TRANSITION_WINDOW_SECONDS = 30.0
+APPLE_PROPOSAL_MIN_SCORE = 0.55
+
+
+def _apple_messages(observation: Observation) -> list[dict[str, Any]]:
+    profile = analyze_manufacturer_data(observation.manufacturer_data)
+    messages = profile.get("continuity_messages")
+    if profile.get("company_id") != "0x004C" or not isinstance(messages, list):
+        return []
+    return [message for message in messages if isinstance(message, dict) and message.get("complete") is True]
+
+
+def _apple_boundary_evidence(observations: list[Observation]) -> dict[str, Any]:
+    subtypes: set[str] = set()
+    transition_tags: set[str] = set()
+    stable_tokens: set[str] = set()
+    handoff_ivs: list[int] = []
+    proximity_models: set[str] = set()
+    for observation in observations:
+        for message in _apple_messages(observation):
+            name = str(message.get("name") or "")
+            if name:
+                subtypes.add(name)
+            if name in {"nearby_info", "nearby_action"} and message.get("authentication_tag_hash"):
+                transition_tags.add(str(message["authentication_tag_hash"]))
+            if name == "tethering_target_presence" and message.get("identifier_hash"):
+                stable_tokens.add(str(message["identifier_hash"]))
+            if name == "magic_switch" and message.get("data_hash"):
+                stable_tokens.add(str(message["data_hash"]))
+            if name == "handoff" and isinstance(message.get("iv"), int):
+                handoff_ivs.append(int(message["iv"]))
+            if name == "proximity_pairing" and message.get("device_model_code"):
+                proximity_models.add(str(message["device_model_code"]))
+    return {
+        "subtypes": subtypes,
+        "transition_tags": transition_tags,
+        "stable_tokens": stable_tokens,
+        "handoff_ivs": handoff_ivs,
+        "proximity_models": proximity_models,
+    }
+
+
+def _latest_gatt_model(db: Session, logical_device_id: str) -> str | None:
+    return db.execute(
+        select(DeviceEnrichment.model_number)
+        .where(
+            DeviceEnrichment.logical_device_id == logical_device_id,
+            DeviceEnrichment.status.in_(("success", "partial")),
+            DeviceEnrichment.model_number.is_not(None),
+        )
+        .order_by(desc(DeviceEnrichment.enriched_at))
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _apple_transition_candidate(
+    predecessor_observations: list[Observation],
+    successor_observations: list[Observation],
+    predecessor_gatt_model: str | None,
+    successor_gatt_model: str | None,
+) -> dict[str, Any] | None:
+    predecessor_last = predecessor_observations[-1]
+    successor_first = successor_observations[0]
+    gap_seconds = (
+        ensure_utc(successor_first.observed_at) - ensure_utc(predecessor_last.observed_at)
+    ).total_seconds()
+    if gap_seconds < 0 or gap_seconds > APPLE_TRANSITION_WINDOW_SECONDS:
+        return None
+
+    predecessor_boundary = predecessor_observations[-3:]
+    successor_boundary = successor_observations[:3]
+    predecessor = _apple_boundary_evidence(predecessor_boundary)
+    successor = _apple_boundary_evidence(successor_boundary)
+    subtype_overlap = sorted(predecessor["subtypes"] & successor["subtypes"])
+    if not subtype_overlap:
+        return None
+
+    matching_transition_tags = sorted(
+        predecessor["transition_tags"] & successor["transition_tags"]
+    )
+    matching_stable_tokens = sorted(
+        predecessor["stable_tokens"] & successor["stable_tokens"]
+    )
+    matching_proximity_models = sorted(
+        predecessor["proximity_models"] & successor["proximity_models"]
+    )
+    handoff_delta = None
+    if predecessor["handoff_ivs"] and successor["handoff_ivs"]:
+        handoff_delta = (
+            successor["handoff_ivs"][0] - predecessor["handoff_ivs"][-1]
+        ) % 65536
+        if handoff_delta > 32:
+            handoff_delta = None
+
+    predecessor_rssi = float(median([item.rssi for item in predecessor_boundary]))
+    successor_rssi = float(median([item.rssi for item in successor_boundary]))
+    rssi_difference = abs(successor_rssi - predecessor_rssi)
+    gatt_model_match = bool(
+        predecessor_gatt_model
+        and successor_gatt_model
+        and predecessor_gatt_model == successor_gatt_model
+    )
+    protocol_transition_evidence = bool(
+        matching_transition_tags or matching_stable_tokens or handoff_delta is not None
+    )
+    composite_model_evidence = (
+        gatt_model_match
+        and gap_seconds <= 15
+        and rssi_difference <= 12
+    )
+    if not protocol_transition_evidence and not composite_model_evidence:
+        return None
+
+    score = 0.08
+    score += 0.45 if matching_transition_tags else 0.0
+    score += 0.55 if matching_stable_tokens else 0.0
+    score += 0.40 if handoff_delta is not None else 0.0
+    score += 0.30 if gatt_model_match else 0.0
+    score += 0.08 if matching_proximity_models else 0.0
+    score += 0.10 if gap_seconds <= 5 else 0.06 if gap_seconds <= 15 else 0.03
+    score += 0.08 if rssi_difference <= 6 else 0.04 if rssi_difference <= 12 else 0.0
+    score = min(score, 0.99)
+    if score < APPLE_PROPOSAL_MIN_SCORE:
+        return None
+    return {
+        "score": score,
+        "gap_seconds": gap_seconds,
+        "rssi_difference_db": rssi_difference,
+        "subtype_overlap": subtype_overlap,
+        "matching_transition_tag_hashes": matching_transition_tags,
+        "matching_stable_token_hashes": matching_stable_tokens,
+        "handoff_iv_delta": handoff_delta,
+        "matching_proximity_model_codes": matching_proximity_models,
+        "gatt_model_match": gatt_model_match,
+        "gatt_model": successor_gatt_model if gatt_model_match else None,
+        "protocol_transition_evidence": protocol_transition_evidence,
+    }
+
+
+def run_apple_continuity_correlation(
+    db: Session,
+    successor_identity_ids: set[str] | None,
+) -> int:
+    if not successor_identity_ids:
+        return 0
+    successors = db.execute(
+        select(ObservedIdentity).where(
+            ObservedIdentity.id.in_(successor_identity_ids),
+            ObservedIdentity.randomized_address.is_(True),
+        )
+    ).scalars().all()
+    proposals = 0
+    gatt_models: dict[str, str | None] = {}
+    observations_by_identity: dict[str, list[Observation]] = {}
+
+    def observations_for(identity_id: str) -> list[Observation]:
+        if identity_id not in observations_by_identity:
+            observations_by_identity[identity_id] = _identity_observations(db, identity_id)
+        return observations_by_identity[identity_id]
+
+    def gatt_model_for(logical_device_id: str) -> str | None:
+        if logical_device_id not in gatt_models:
+            gatt_models[logical_device_id] = _latest_gatt_model(db, logical_device_id)
+        return gatt_models[logical_device_id]
+
+    for successor in successors:
+        successor_observations = observations_for(successor.id)
+        successor_device = _logical_for_identity(successor_observations)
+        if not successor_observations or successor_device is None:
+            continue
+        successor_first = successor_observations[0]
+        if not _apple_messages(successor_first):
+            continue
+        successor_at = ensure_utc(successor_first.observed_at)
+        predecessor_ids = set(
+            db.execute(
+                select(Observation.observed_identity_id).where(
+                    Observation.scanner_id == successor_first.scanner_id,
+                    Observation.observed_identity_id != successor.id,
+                    Observation.observed_at >= successor_at - timedelta(
+                        seconds=APPLE_TRANSITION_WINDOW_SECONDS
+                    ),
+                    Observation.observed_at <= successor_at,
+                )
+            ).scalars()
+        )
+        candidates: list[
+            tuple[dict[str, Any], ObservedIdentity, LogicalDevice, list[Observation]]
+        ] = []
+        successor_model = gatt_model_for(successor_device.id)
+        for predecessor_id in predecessor_ids:
+            predecessor = db.get(ObservedIdentity, predecessor_id)
+            if predecessor is None:
+                continue
+            predecessor_observations = observations_for(predecessor.id)
+            predecessor_device = _logical_for_identity(predecessor_observations)
+            if (
+                not predecessor_observations
+                or predecessor_device is None
+                or predecessor_device.id == successor_device.id
+                or ensure_utc(predecessor_observations[-1].observed_at) > successor_at
+            ):
+                continue
+            predecessor_model = gatt_model_for(predecessor_device.id)
+            evidence = _apple_transition_candidate(
+                predecessor_observations,
+                successor_observations,
+                predecessor_model,
+                successor_model,
+            )
+            if evidence is not None:
+                candidates.append(
+                    (evidence, predecessor, predecessor_device, predecessor_observations)
+                )
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0]["score"], reverse=True)
+        evidence, predecessor, predecessor_device, _ = candidates[0]
+        if _correlation_exists(
+            db,
+            predecessor.id,
+            successor.id,
+            "apple_continuity_transition_v1",
+        ):
+            continue
+        runner_up_score = candidates[1][0]["score"] if len(candidates) > 1 else None
+        score_margin = (
+            evidence["score"] - runner_up_score
+            if runner_up_score is not None
+            else None
+        )
+        correlation = _record_identity_correlation(
+            db,
+            predecessor_identity=predecessor,
+            successor_identity=successor,
+            predecessor_device=predecessor_device,
+            successor_device=successor_device,
+            method="apple_continuity_transition_v1",
+            status="proposal",
+            time_difference_seconds=evidence["gap_seconds"],
+            rssi_difference_db=evidence["rssi_difference_db"],
+            search_window_seconds=APPLE_TRANSITION_WINDOW_SECONDS,
+            details={
+                **evidence,
+                "scanner_id": successor_first.scanner_id,
+                "evidence_score": evidence["score"],
+                "candidate_count": len(candidates),
+                "runner_up_score": runner_up_score,
+                "score_margin": score_margin,
+                "automatic_acceptance": False,
+                "identity_claim": "possible_match_not_confirmed_physical_identity",
+                "research_basis": [
+                    "apple_continuity_tlv",
+                    "nearby_info_auth_tag_transition",
+                    "handoff_monotonic_iv",
+                ],
+            },
+        )
+        if correlation is not None:
+            proposals += 1
+    return proposals
+
+
+def run_identity_correlation(
+    db: Session,
+    include_statistical_review: bool = True,
+    successor_identity_ids: set[str] | None = None,
+) -> dict[str, int]:
     """Run auditable address-rotation correlation after a batch is flushed.
 
     This implements the time/RSSI cost from Akiyama and Taniguchi for proposals
@@ -1236,8 +1586,12 @@ def run_identity_correlation(db: Session, include_statistical_review: bool = Tru
     """
 
     config = correlation_config(db)
+    apple_proposals = run_apple_continuity_correlation(
+        db,
+        successor_identity_ids,
+    )
     if not config["token_rules"] and not include_statistical_review and not config["auto_accept_statistical"]:
-        return {"accepted": 0, "proposals": 0}
+        return {"accepted": 0, "proposals": apple_proposals}
     identities = db.execute(
         select(ObservedIdentity)
         .where(ObservedIdentity.randomized_address.is_(True))
@@ -1253,7 +1607,7 @@ def run_identity_correlation(db: Session, include_statistical_review: bool = Tru
             metadata[identity.id] = (observations[0], observations[-1], device)
 
     accepted = 0
-    proposals = 0
+    proposals = apple_proposals
     token_evidence = {
         identity.id: _identity_token_evidence(observations_by_identity[identity.id], config["token_rules"])
         for identity in identities
@@ -1473,6 +1827,7 @@ def process_batch(db: Session, scanner: Scanner, payload: ObservationBatchIn) ->
     ignored = 0
     errors = 0
     logical_device_ids: set[str] = set()
+    new_observed_identity_ids: set[str] = set()
     previous_status = scanner.status
 
     for obs in payload.observations:
@@ -1482,6 +1837,11 @@ def process_batch(db: Session, scanner: Scanner, payload: ObservationBatchIn) ->
                 accepted += 1
                 if result.get("logical_device_id"):
                     logical_device_ids.add(result["logical_device_id"])
+                if (
+                    result.get("correlation_reason") == "created_new_logical_device"
+                    and result.get("observed_identity_id")
+                ):
+                    new_observed_identity_ids.add(result["observed_identity_id"])
             elif result.get("duplicate"):
                 duplicates += 1
             elif result.get("ignored"):
@@ -1515,7 +1875,11 @@ def process_batch(db: Session, scanner: Scanner, payload: ObservationBatchIn) ->
         )
     db.flush()
     try:
-        correlations = run_identity_correlation(db, include_statistical_review=False)
+        correlations = run_identity_correlation(
+            db,
+            include_statistical_review=False,
+            successor_identity_ids=new_observed_identity_ids,
+        )
     except Exception as exc:  # noqa: BLE001
         correlations = {"accepted": 0, "proposals": 0}
         errors += 1
@@ -1634,6 +1998,9 @@ def serialize_scanner(scanner: Scanner) -> dict[str, Any]:
         "zone": scanner.zone,
         "latitude": scanner.latitude,
         "longitude": scanner.longitude,
+        "location_source": scanner.location_source,
+        "location_observed_at": serialize_datetime(scanner.location_observed_at),
+        "location_accuracy_m": scanner.location_accuracy_m,
         "indoor_x": scanner.indoor_x,
         "indoor_y": scanner.indoor_y,
         "orientation_deg": scanner.orientation_deg,
@@ -1792,14 +2159,25 @@ def serialize_device(
     latest_observation: Observation | None = None,
     latest_enrichment: DeviceEnrichment | None = None,
     identity_basis: str | None = None,
+    visibility_class: str | None = None,
 ) -> dict[str, Any]:
     proximity_model = proximity_model_from_estimate(latest_location)
+    location_details = (
+        latest_location.details
+        if latest_location is not None and isinstance(latest_location.details, dict)
+        else {}
+    )
     manufacturer_profile = manufacturer_profile_from_observation(latest_observation)
     address_type = (device.primary_address_type or "").lower()
     identity_basis = identity_basis or (
         "unresolved_randomized_address"
         if any(token in address_type for token in ("random", "private", "rpa"))
         else "observed_stable_address"
+    )
+    visibility_class = visibility_class or (
+        "transient_broadcast"
+        if identity_basis == "unresolved_randomized_address"
+        else "device_candidate"
     )
     resolved_name = device.alias or (latest_enrichment.device_name if latest_enrichment else None) or device.display_name
     name_source = (
@@ -1827,6 +2205,7 @@ def serialize_device(
         "identity_confidence": device.identity_confidence,
         "identity_basis": identity_basis,
         "presence_trackable": identity_basis != "unresolved_randomized_address",
+        "visibility_class": visibility_class,
         "location_confidence": device.location_confidence,
         "movement_confidence": device.movement_confidence,
         "current_scanner_id": device.current_scanner_id,
@@ -1846,7 +2225,10 @@ def serialize_device(
             "longitude": device.longitude,
             "anchored_at": serialize_datetime(device.location_anchor_observed_at),
             "source": "scanner_snapshot_at_observation",
-            "update_policy": "different_scanner_or_missing_anchor",
+            "scanner_location_source": location_details.get("scanner_location_source"),
+            "scanner_location_observed_at": location_details.get("scanner_location_observed_at"),
+            "accuracy_m": location_details.get("scanner_location_accuracy_m"),
+            "update_policy": "latest_observation_with_current_scanner_position",
         },
         "first_seen_at": serialize_datetime(device.first_seen_at),
         "last_seen_at": serialize_datetime(device.last_seen_at),
@@ -1969,10 +2351,56 @@ def presence_identity_bases(db: Session, devices: list[LogicalDevice]) -> dict[s
     return bases
 
 
+def device_visibility_classes(
+    db: Session,
+    devices: list[LogicalDevice],
+    identity_bases: dict[str, str],
+) -> dict[str, str]:
+    """Promote direct named broadcasts without treating them as durable identity."""
+    if not devices:
+        return {}
+    device_ids = [device.id for device in devices]
+    named_broadcast_ids = set(
+        db.execute(
+            select(Observation.logical_device_id)
+            .join(
+                ObservedIdentity,
+                ObservedIdentity.id == Observation.observed_identity_id,
+            )
+            .where(
+                Observation.logical_device_id.in_(device_ids),
+                or_(
+                    and_(
+                        ObservedIdentity.local_name.is_not(None),
+                        ObservedIdentity.local_name != "",
+                    ),
+                    and_(
+                        ObservedIdentity.advertised_name.is_not(None),
+                        ObservedIdentity.advertised_name != "",
+                    ),
+                ),
+            )
+            .distinct()
+        ).scalars()
+    )
+    return {
+        device.id: (
+            "device_candidate"
+            if identity_bases.get(device.id) != "unresolved_randomized_address"
+            else "named_broadcast_candidate"
+            if device.id in named_broadcast_ids
+            else "transient_broadcast"
+        )
+        for device in devices
+    }
+
+
 def overview(db: Session) -> dict[str, Any]:
     scanners = db.execute(select(Scanner)).scalars().all()
     devices = db.execute(select(LogicalDevice)).scalars().all()
     identity_bases = presence_identity_bases(db, devices)
+    visibility_classes = device_visibility_classes(db, devices, identity_bases)
+    present_statuses = {"active", "newly_detected", "returned"}
     trackable_devices = [
         device for device in devices if identity_bases.get(device.id) != "unresolved_randomized_address"
     ]
@@ -1987,11 +2415,18 @@ def overview(db: Session) -> dict[str, Any]:
         "scanner_total": len(scanners),
         "scanner_online": sum(1 for scanner in scanners if scanner.status == "online"),
         "scanner_offline": sum(1 for scanner in scanners if scanner.status == "offline"),
+        "present_ble_records": sum(1 for device in devices if device.status in present_statuses),
         "active_devices": sum(
-            1 for device in trackable_devices if device.status in {"active", "newly_detected", "returned"}
+            1 for device in trackable_devices if device.status in present_statuses
         ),
         "active_unresolved_identities": sum(
-            1 for device in unresolved_devices if device.status in {"active", "newly_detected", "returned"}
+            1 for device in unresolved_devices if device.status in present_statuses
+        ),
+        "visible_device_candidates": sum(
+            1
+            for device in devices
+            if device.status in present_statuses
+            and visibility_classes.get(device.id) != "transient_broadcast"
         ),
         "newly_detected_devices": sum(1 for device in trackable_devices if device.status == "newly_detected"),
         "moving_devices": sum(
@@ -2025,6 +2460,7 @@ def list_devices(
     scanner_id: str | None = None,
     include_ignored: bool = False,
     include_expired: bool = False,
+    include_transient: bool = True,
 ) -> list[dict[str, Any]]:
     query = select(LogicalDevice).order_by(desc(LogicalDevice.last_seen_at))
     if status == "present":
@@ -2039,6 +2475,13 @@ def list_devices(
         query = query.where(LogicalDevice.status != "identity_expired")
     devices = db.execute(query).scalars().all()
     identity_bases = presence_identity_bases(db, devices)
+    visibility_classes = device_visibility_classes(db, devices, identity_bases)
+    if not include_transient:
+        devices = [
+            device
+            for device in devices
+            if visibility_classes.get(device.id) != "transient_broadcast"
+        ]
     latest = latest_location_estimates(db, [device.id for device in devices])
     observations = latest_observations(db, [device.id for device in devices])
     enrichments = latest_device_enrichments(db, [device.id for device in devices])
@@ -2049,6 +2492,7 @@ def list_devices(
             observations.get(device.id),
             enrichments.get(device.id),
             identity_bases.get(device.id),
+            visibility_classes.get(device.id),
         )
         for device in devices
     ]
@@ -2123,13 +2567,20 @@ def device_detail(db: Session, device_id: str) -> dict[str, Any] | None:
                 "observation_count": identity.observation_count,
             }
         )
+    identity_basis = presence_identity_bases(db, [device]).get(device.id)
+    visibility_class = device_visibility_classes(
+        db,
+        [device],
+        {device.id: identity_basis},
+    ).get(device.id)
     return {
         "device": serialize_device(
             device,
             latest.get(device_id),
             observations[0] if observations else None,
             enrichments[0] if enrichments else None,
-            presence_identity_bases(db, [device]).get(device.id),
+            identity_basis,
+            visibility_class,
         ),
         "observed_identities": observed_identities,
         "recent_observations": [serialize_recent_observation(observation) for observation in observations],
@@ -2161,14 +2612,53 @@ def patch_scanner(db: Session, scanner_id: str, payload: ScannerPatchIn) -> dict
     scanner = db.get(Scanner, scanner_id)
     if scanner is None:
         return None
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    coordinates_supplied = "latitude" in updates or "longitude" in updates
+    for field, value in updates.items():
         setattr(scanner, field, value)
+    if coordinates_supplied:
+        scanner.location_source = "configured"
+        scanner.location_observed_at = utcnow()
+        scanner.location_accuracy_m = None
     scanner.config_version += 1
     config = get_scanner_config(db, scanner_id)
     config.version = scanner.config_version
     db.commit()
     db.refresh(scanner)
     return serialize_scanner(scanner)
+
+
+def record_scanner_position(
+    db: Session,
+    scanner_id: str,
+    payload: ScannerPositionIn,
+) -> dict[str, Any] | None:
+    scanner = db.get(Scanner, scanner_id)
+    if scanner is None:
+        return None
+
+    observed_at = ensure_utc(payload.observed_at)
+    if observed_at > utcnow() + timedelta(minutes=1):
+        raise ValueError("scanner position timestamp is too far in the future")
+
+    current_observed_at = (
+        ensure_utc(scanner.location_observed_at)
+        if scanner.location_observed_at is not None
+        else None
+    )
+    applied = current_observed_at is None or observed_at > current_observed_at
+    if applied:
+        scanner.latitude = payload.latitude
+        scanner.longitude = payload.longitude
+        scanner.location_source = payload.source
+        scanner.location_observed_at = observed_at
+        scanner.location_accuracy_m = payload.accuracy_m
+        db.commit()
+        db.refresh(scanner)
+
+    result = serialize_scanner(scanner)
+    result["position_applied"] = applied
+    return result
 
 
 def list_events(db: Session, event_type: str | None = None, scanner_id: str | None = None, device_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -2202,6 +2692,7 @@ def patch_settings(db: Session, payload: SettingsPatchIn) -> dict[str, Any]:
 
 
 def diagnostics(db: Session) -> dict[str, Any]:
+    now = utcnow()
     invalid_payload_count = db.execute(select(func.count(ProcessingError.id))).scalar_one()
     observation_count = db.execute(select(func.count(Observation.id))).scalar_one()
     event_count = db.execute(select(func.count(DeviceEvent.id))).scalar_one()
@@ -2211,6 +2702,9 @@ def diagnostics(db: Session) -> dict[str, Any]:
     ).scalar_one()
     logical_device_count = db.execute(select(func.count(LogicalDevice.id))).scalar_one()
     identity_correlation_count = db.execute(select(func.count(DeviceIdentityCorrelation.id))).scalar_one()
+    tracking_session_count = db.execute(select(func.count(DeviceTrackingSession.id))).scalar_one()
+    tracking_sample_count = db.execute(select(func.count(DeviceTrackingSample.id))).scalar_one()
+    scanners = db.execute(select(Scanner).order_by(Scanner.id)).scalars().all()
     latest_heartbeat = db.execute(select(ScannerHeartbeat).order_by(desc(ScannerHeartbeat.received_at)).limit(1)).scalar_one_or_none()
     recent_errors = db.execute(select(ProcessingError).order_by(desc(ProcessingError.created_at)).limit(20)).scalars()
     return {
@@ -2220,6 +2714,8 @@ def diagnostics(db: Session) -> dict[str, Any]:
             "invalid_payload_count": invalid_payload_count,
             "observation_count": observation_count,
             "event_count": event_count,
+            "tracking_session_count": tracking_session_count,
+            "tracking_sample_count": tracking_sample_count,
         },
         "identity_counts": {
             "observed_identities": observed_identity_count,
@@ -2236,6 +2732,24 @@ def diagnostics(db: Session) -> dict[str, Any]:
         }
         if latest_heartbeat
         else None,
+        "scanner_positions": [
+            {
+                "scanner_id": scanner.id,
+                "coordinates_available": scanner_position_is_available(scanner),
+                "source": scanner.location_source,
+                "observed_at": serialize_datetime(scanner.location_observed_at),
+                "age_seconds": (
+                    max(
+                        0.0,
+                        (now - ensure_utc(scanner.location_observed_at)).total_seconds(),
+                    )
+                    if scanner.location_observed_at is not None
+                    else None
+                ),
+                "accuracy_m": scanner.location_accuracy_m,
+            }
+            for scanner in scanners
+        ],
         "recent_errors": [
             {
                 "scanner_id": error.scanner_id,

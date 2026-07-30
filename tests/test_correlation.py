@@ -15,6 +15,7 @@ from backend.app.correlation import (
     rssi_regression_difference,
 )
 from backend.app.database import Base
+from backend.app.device_intelligence import analyze_manufacturer_data
 from backend.app.models import (
     DeviceIdentityCorrelation,
     DeviceLocationEstimate,
@@ -164,6 +165,115 @@ def _trusted_token_batch(batch_id: str, observation_id: str, observed_at, addres
             }
         ],
     )
+
+
+def _trusted_apple_nearby_batch(
+    batch_id: str,
+    observation_id: str,
+    observed_at,
+    address: str,
+    *,
+    auth_tag: str = "aabbcc",
+    rssi: int = -70,
+) -> ObservationBatchIn:
+    manufacturer_data = f"4c0010050102{auth_tag}"
+    raw_advertising = f"{(len(manufacturer_data) // 2) + 1:02x}ff{manufacturer_data}"
+    return ObservationBatchIn(
+        batch_id=batch_id,
+        sent_at=observed_at,
+        time_source="usb_host_synchronized",
+        boot_id="test-boot",
+        clock_sync_age_ms=1,
+        observations=[
+            {
+                "observation_id": observation_id,
+                "observed_at": observed_at,
+                "time_source": "usb_host_synchronized",
+                "boot_id": "test-boot",
+                "monotonic_ms": int(observed_at.timestamp() * 1000),
+                "scan_cycle": 1,
+                "clock_sync_age_ms": 1,
+                "address": address,
+                "address_type": "random",
+                "rssi": rssi,
+                "raw_advertising_payload": raw_advertising,
+                "advertising_packet_length": len(raw_advertising) // 2,
+                "packet_length": len(raw_advertising) // 2,
+                "payload_layout_version": 2,
+            }
+        ],
+    )
+
+
+def test_apple_continuity_parser_handles_concatenated_published_tlvs():
+    manufacturer_data = (
+        "4c00"
+        "10050102aabbcc"
+        "0c0e010001aa00112233445566778899"
+    )
+
+    profile = analyze_manufacturer_data(manufacturer_data)
+
+    assert profile["continuity_subtypes"] == ["handoff", "nearby_info"]
+    nearby, handoff = profile["continuity_messages"]
+    assert nearby["authentication_tag_hash"]
+    assert nearby["activity_level"] == 1
+    assert handoff["iv"] == 1
+    assert handoff["encrypted_payload_hash"]
+    assert "00112233445566778899" not in str(profile)
+
+
+def test_live_apple_address_transition_creates_proposal_without_merging():
+    TestSession = _test_session()
+    start = utcnow() - timedelta(seconds=10)
+    with TestSession() as db:
+        scanner = _scanner(db, "scn_apple", "Lab", -6.2, 106.8)
+        db.commit()
+        process_batch(
+            db,
+            scanner,
+            _trusted_apple_nearby_batch(
+                "apple-old-1",
+                "apple-old-observation-1",
+                start,
+                "c1:7d:8a:b9:7f:4e",
+            ),
+        )
+        process_batch(
+            db,
+            scanner,
+            _trusted_apple_nearby_batch(
+                "apple-old-2",
+                "apple-old-observation-2",
+                start + timedelta(seconds=1),
+                "c1:7d:8a:b9:7f:4e",
+                rssi=-69,
+            ),
+        )
+
+        result = process_batch(
+            db,
+            scanner,
+            _trusted_apple_nearby_batch(
+                "apple-new-1",
+                "apple-new-observation-1",
+                start + timedelta(seconds=3),
+                "5c:c5:ba:61:40:54",
+                rssi=-68,
+            ),
+        )
+
+        assert result["identity_correlations"] == {"accepted": 0, "proposals": 1}
+        correlation = db.execute(select(DeviceIdentityCorrelation)).scalar_one()
+        assert correlation.method == "apple_continuity_transition_v1"
+        assert correlation.status == "proposal"
+        assert correlation.details["subtype_overlap"] == ["nearby_info"]
+        assert correlation.details["matching_transition_tag_hashes"]
+        assert correlation.details["automatic_acceptance"] is False
+        assert correlation.details["identity_claim"] == "possible_match_not_confirmed_physical_identity"
+        assert db.execute(
+            select(func.count(LogicalDevice.id)).where(LogicalDevice.ignored.is_(False))
+        ).scalar_one() == 2
 
 
 def test_approved_ad_token_moves_canonical_device_location_between_scanners():

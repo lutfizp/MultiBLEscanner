@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+host/assets/tone.wav
+firmware/build/
+build/
+.west/
+*.hex
+*.elf
+*.map
+*.zip
+.env

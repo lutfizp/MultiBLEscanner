@@ -10,7 +10,7 @@ from backend.app.bluetooth_sig import (
     company_name_from_manufacturer_data,
 )
 from backend.app.bluetooth_ad import parse_advertising_and_scan_response
-from backend.app.database import SQLITE_BUSY_TIMEOUT_SECONDS, Base, engine_options
+from backend.app.database import SQLITE_BUSY_TIMEOUT_SECONDS, SQLITE_POOL_SIZE, Base, engine_options
 from backend.app.device_intelligence import analyze_manufacturer_data, infer_device_category, short_uuid
 from backend.app.models import DeviceEvent
 from backend.app.processing import (
@@ -28,7 +28,14 @@ from backend.app.processing import (
     signal_band_from_rssi,
     utcnow,
 )
-from backend.app.schemas import BLEObservationIn, HeartbeatIn, ObservationBatchIn
+from backend.app.schemas import (
+    BLEObservationIn,
+    BrowserLocationDiagnosticIn,
+    GATTEnrichmentIn,
+    HeartbeatIn,
+    ObservationBatchIn,
+    ScannerPositionIn,
+)
 from backend.app.services import create_event, serialize_datetime
 
 
@@ -40,10 +47,29 @@ def test_rssi_signal_bands_do_not_claim_distance():
     assert proximity_band(None, -70) == "signal_moderate"
 
 
-def test_sqlite_engine_uses_waitable_single_connection_options():
+def test_browser_location_diagnostic_contains_no_coordinate_fields():
+    payload = BrowserLocationDiagnosticIn(
+        recorded_at=utcnow(),
+        stage="timeout",
+        page_origin="https://localhost:8000",
+        secure_context=True,
+        permission_state="granted",
+        watcher_active=True,
+        visibility_state="visible",
+        error_code=3,
+        error_message="location delayed",
+    )
+
+    serialized = payload.model_dump(mode="json")
+    assert "latitude" not in serialized
+    assert "longitude" not in serialized
+
+
+def test_sqlite_engine_uses_bounded_wal_friendly_pool_options():
     options = engine_options("sqlite:////tmp/bluetooth-scanner.sqlite3")
 
-    assert options["pool_size"] == 1
+    assert options["pool_size"] == SQLITE_POOL_SIZE
+    assert options["pool_size"] > 1
     assert options["max_overflow"] == 0
     assert options["pool_timeout"] == SQLITE_BUSY_TIMEOUT_SECONDS
     assert options["connect_args"]["timeout"] == SQLITE_BUSY_TIMEOUT_SECONDS
@@ -194,7 +220,7 @@ def test_scan_data_reset_preserves_scanner_setup_and_clears_runtime_state():
             ).scalar_one()
             is not None
         )
-        assert db.execute(select(ScannerConfiguration)).scalar_one().rssi_min == -85
+        assert db.execute(select(ScannerConfiguration)).scalar_one().rssi_min == -110
 
 
 def test_present_device_filter_excludes_missing_and_offline_history():
@@ -295,6 +321,116 @@ def test_unresolved_random_address_expires_without_becoming_offline_device():
             db,
             Settings(presence_missing_seconds=45, presence_offline_seconds=180),
         ) == []
+
+
+def test_overview_separates_present_ble_records_from_trackable_devices():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import LogicalDevice
+    from backend.app.services import list_devices, overview
+
+    now = utcnow()
+    with TestSession() as db:
+        db.add_all(
+            [
+                LogicalDevice(
+                    primary_address="24:11:11:b3:eb:ee",
+                    primary_address_type="public",
+                    display_name="Stable TWS",
+                    status="active",
+                    movement_status="signal_stable",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    observation_count=4,
+                    identity_signature={},
+                ),
+                LogicalDevice(
+                    primary_address="5b:ff:fa:8b:66:a4",
+                    primary_address_type="random",
+                    display_name="5b:ff:fa:8b:66:a4",
+                    status="returned",
+                    movement_status="probably_moving",
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    observation_count=1,
+                    identity_signature={},
+                ),
+                LogicalDevice(
+                    primary_address="7a:11:22:33:44:55",
+                    primary_address_type="random",
+                    display_name="Expired random identity",
+                    status="identity_expired",
+                    movement_status="stationary",
+                    first_seen_at=now - timedelta(minutes=10),
+                    last_seen_at=now - timedelta(minutes=10),
+                    observation_count=1,
+                    identity_signature={},
+                ),
+            ],
+        )
+        db.commit()
+
+        summary = overview(db)
+
+        visible = list_devices(db, include_expired=True, include_transient=False)
+
+    assert summary["present_ble_records"] == 2
+    assert summary["active_devices"] == 1
+    assert summary["active_unresolved_identities"] == 1
+    assert summary["visible_device_candidates"] == 1
+    assert [device["display_name"] for device in visible] == ["Stable TWS"]
+
+
+def test_named_random_advertiser_is_visible_without_becoming_durable_identity():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import Scanner, ScannerConfiguration
+    from backend.app.services import list_devices, process_batch
+
+    raw_advertising = "0201060b094e616d65642042756473"
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn_named_random",
+            display_name="Named Random Scanner",
+            hardware_id="named-random-hardware",
+            token_hash="hash",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+
+        process_batch(
+            db,
+            scanner,
+            ObservationBatchIn(
+                batch_id="batch-named-random",
+                observations=[
+                    {
+                        "observation_id": "obs-named-random",
+                        "address": "6a:12:34:56:78:90",
+                        "address_type": "random",
+                        "rssi": -92,
+                        "raw_advertising_payload": raw_advertising,
+                        "advertising_packet_length": len(raw_advertising) // 2,
+                        "packet_length": len(raw_advertising) // 2,
+                        "payload_layout_version": 2,
+                    }
+                ],
+            ),
+        )
+
+        visible = list_devices(db, include_transient=False)
+
+        assert len(visible) == 1
+        assert visible[0]["display_name"] == "Named Buds"
+        assert visible[0]["visibility_class"] == "named_broadcast_candidate"
+        assert visible[0]["presence_trackable"] is False
 
 
 def test_normalize_hex_rejects_invalid_payload():
@@ -512,6 +648,19 @@ def test_gatt_enrichment_is_directly_stored_and_preferred_for_display_name():
         detail = device_detail(db, device["id"])
         assert detail["device_enrichments"][0]["transport"] == "ble_gatt"
         assert detail["recent_observations"][0]["gatt_enrichment"]["status"] == "success"
+
+
+@pytest.mark.parametrize("status", ["operation_timeout", "cancelled"])
+def test_gatt_terminal_worker_statuses_are_valid_direct_evidence(status):
+    enrichment = GATTEnrichmentIn(
+        status=status,
+        error_code=f"test_{status}",
+        attempt_duration_ms=15_000,
+    )
+
+    assert enrichment.status == status
+    assert enrichment.device_name is None
+    assert enrichment.error_code == f"test_{status}"
 
 
 def test_live_processing_persists_paper_rssi_window_evidence():
@@ -862,6 +1011,42 @@ def test_usb_serial_empty_datetime_fields_are_accepted():
     assert batch.observations[0].scanner_time is None
 
 
+def test_heartbeat_updates_scanner_hardware_provenance():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import Scanner
+    from backend.app.services import record_heartbeat
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn_hardware",
+            display_name="Hardware Scanner",
+            hardware_id="hardware-scanner-001",
+            token_hash="hash",
+            hardware_version="esp32",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.commit()
+
+        result = record_heartbeat(
+            db,
+            scanner,
+            HeartbeatIn(
+                message_id="hb-hardware-1",
+                firmware_version="esp32-ble-scanner-1.4.1",
+                hardware_version="esp32-d0wd-v3",
+            ),
+        )
+        db.refresh(scanner)
+
+        assert result == {"accepted": True, "duplicate": False}
+        assert scanner.firmware_version == "esp32-ble-scanner-1.4.1"
+        assert scanner.hardware_version == "esp32-d0wd-v3"
+
+
 def test_usb_observation_reuses_scanner_time_when_observed_at_is_missing():
     reported_at = utcnow()
     batch = ObservationBatchIn(
@@ -1155,7 +1340,7 @@ def test_same_device_moves_to_new_scanner_location_and_keeps_location_history():
         assert delayed_observation.processing_notes["updates_current_location"] is False
 
 
-def test_moving_same_scanner_does_not_drag_device_location_anchor():
+def test_moving_scanner_updates_device_anchor_only_after_a_new_ble_observation():
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
@@ -1164,6 +1349,7 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
     from backend.app.services import list_devices, process_batch
 
     with TestSession() as db:
+        first_seen = utcnow()
         scanner = Scanner(
             id="scn_movable_anchor",
             display_name="Movable Scanner",
@@ -1173,6 +1359,9 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
             latitude=-6.226100,
             longitude=106.852900,
             zone="Tebet",
+            location_source="browser_geolocation",
+            location_observed_at=first_seen,
+            location_accuracy_m=12.0,
             enabled=True,
         )
         db.add(scanner)
@@ -1180,7 +1369,6 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
         db.add(ScannerConfiguration(scanner_id=scanner.id))
         db.commit()
 
-        first_seen = utcnow()
         first_batch = ObservationBatchIn(
             batch_id="batch-anchor-tebet",
             sent_at=first_seen,
@@ -1204,12 +1392,26 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
         )
         process_batch(db, scanner, first_batch)
 
+        device = db.execute(select(LogicalDevice)).scalar_one()
+        assert device.current_zone == "Tebet"
+        assert device.latitude == pytest.approx(-6.226100)
+        assert device.longitude == pytest.approx(106.852900)
+        assert ensure_utc(device.location_anchor_observed_at) == first_seen
+
+        second_seen = first_seen + timedelta(seconds=10)
         scanner.latitude = -6.238300
         scanner.longitude = 106.975600
         scanner.zone = "Bekasi"
+        scanner.location_observed_at = second_seen
+        scanner.location_accuracy_m = 8.0
         db.commit()
 
-        second_seen = first_seen + timedelta(seconds=10)
+        db.refresh(device)
+        assert device.current_zone == "Tebet"
+        assert device.latitude == pytest.approx(-6.226100)
+        assert device.longitude == pytest.approx(106.852900)
+        assert ensure_utc(device.location_anchor_observed_at) == first_seen
+
         second_batch = ObservationBatchIn(
             batch_id="batch-anchor-same-scanner",
             sent_at=second_seen,
@@ -1235,20 +1437,23 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
 
         device = db.execute(select(LogicalDevice)).scalar_one()
         assert device.current_scanner_id == scanner.id
-        assert device.current_zone == "Tebet"
-        assert device.latitude == pytest.approx(-6.226100)
-        assert device.longitude == pytest.approx(106.852900)
-        assert ensure_utc(device.location_anchor_observed_at) == first_seen
+        assert device.current_zone == "Bekasi"
+        assert device.latitude == pytest.approx(-6.238300)
+        assert device.longitude == pytest.approx(106.975600)
+        assert ensure_utc(device.location_anchor_observed_at) == second_seen
 
         serialized = list_devices(db)[0]
         assert serialized["location_anchor"] == {
             "scanner_id": scanner.id,
-            "zone": "Tebet",
-            "latitude": pytest.approx(-6.226100),
-            "longitude": pytest.approx(106.852900),
-            "anchored_at": first_seen.isoformat().replace("+00:00", "Z"),
+            "zone": "Bekasi",
+            "latitude": pytest.approx(-6.238300),
+            "longitude": pytest.approx(106.975600),
+            "anchored_at": second_seen.isoformat().replace("+00:00", "Z"),
             "source": "scanner_snapshot_at_observation",
-            "update_policy": "different_scanner_or_missing_anchor",
+            "scanner_location_source": "browser_geolocation",
+            "scanner_location_observed_at": second_seen.isoformat().replace("+00:00", "Z"),
+            "accuracy_m": pytest.approx(8.0),
+            "update_policy": "latest_observation_with_current_scanner_position",
         }
 
         latest_estimate = db.execute(
@@ -1256,9 +1461,141 @@ def test_moving_same_scanner_does_not_drag_device_location_anchor():
         ).scalars().first()
         assert latest_estimate.details["scanner_latitude"] == pytest.approx(-6.238300)
         assert latest_estimate.details["scanner_longitude"] == pytest.approx(106.975600)
-        assert latest_estimate.details["updates_current_anchor"] is False
+        assert latest_estimate.details["scanner_position_current"] is True
+        assert latest_estimate.details["updates_current_anchor"] is True
 
         location_events = db.execute(
             select(DeviceEvent).where(DeviceEvent.event_type == "device_location_changed")
         ).scalars().all()
-        assert location_events == []
+        assert len(location_events) == 1
+        assert location_events[0].reason == "observed_after_scanner_position_changed"
+        assert location_events[0].details["previous_zone"] == "Tebet"
+        assert location_events[0].details["current_zone"] == "Bekasi"
+
+
+def test_live_scanner_position_is_monotonic_and_does_not_change_firmware_config():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import Scanner, ScannerConfiguration
+    from backend.app.services import diagnostics, record_scanner_position
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn_live_gps",
+            display_name="Live GPS Scanner",
+            hardware_id="live-gps-001",
+            token_hash="hash",
+            status="online",
+            config_version=7,
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id, version=7))
+        db.commit()
+
+        first_seen = utcnow()
+        applied = record_scanner_position(
+            db,
+            scanner.id,
+            ScannerPositionIn(
+                observed_at=first_seen,
+                latitude=-6.226100,
+                longitude=106.852900,
+                accuracy_m=11.5,
+            ),
+        )
+
+        assert applied is not None
+        assert applied["position_applied"] is True
+        assert applied["latitude"] == pytest.approx(-6.226100)
+        assert applied["longitude"] == pytest.approx(106.852900)
+        assert applied["location_source"] == "browser_geolocation"
+        assert applied["location_accuracy_m"] == pytest.approx(11.5)
+        assert applied["config_version"] == 7
+        position_diagnostics = diagnostics(db)["scanner_positions"][0]
+        assert position_diagnostics["scanner_id"] == scanner.id
+        assert position_diagnostics["coordinates_available"] is True
+        assert position_diagnostics["source"] == "browser_geolocation"
+        assert position_diagnostics["accuracy_m"] == pytest.approx(11.5)
+
+        stale = record_scanner_position(
+            db,
+            scanner.id,
+            ScannerPositionIn(
+                observed_at=first_seen - timedelta(seconds=1),
+                latitude=-6.300000,
+                longitude=107.000000,
+                accuracy_m=3.0,
+            ),
+        )
+
+        assert stale is not None
+        assert stale["position_applied"] is False
+        assert stale["latitude"] == pytest.approx(-6.226100)
+        assert stale["longitude"] == pytest.approx(106.852900)
+        assert stale["config_version"] == 7
+
+
+def test_last_reported_browser_position_is_preserved_when_the_fix_is_not_fresh():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import DeviceLocationEstimate, LogicalDevice, Scanner, ScannerConfiguration
+    from backend.app.services import process_batch
+
+    with TestSession() as db:
+        observed_at = utcnow()
+        scanner = Scanner(
+            id="scn_stale_gps",
+            display_name="Stale GPS Scanner",
+            hardware_id="stale-gps-001",
+            token_hash="hash",
+            status="online",
+            latitude=-6.226100,
+            longitude=106.852900,
+            location_source="browser_geolocation",
+            location_observed_at=observed_at - timedelta(minutes=2),
+            location_accuracy_m=18.0,
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+
+        process_batch(
+            db,
+            scanner,
+            ObservationBatchIn(
+                batch_id="batch-stale-gps",
+                sent_at=observed_at,
+                time_source="usb_host_synchronized",
+                boot_id="boot-stale-gps",
+                batch_sequence=1,
+                clock_sync_age_ms=10,
+                observations=[
+                    {
+                        "observation_id": "obs-stale-gps",
+                        "observed_at": observed_at,
+                        "time_source": "usb_host_synchronized",
+                        "boot_id": "boot-stale-gps",
+                        "monotonic_ms": 1_000,
+                        "clock_sync_age_ms": 10,
+                        "address": "80:e1:26:9e:3e:e3",
+                        "address_type": "public",
+                        "rssi": -66,
+                    }
+                ],
+            ),
+        )
+
+        device = db.execute(select(LogicalDevice)).scalar_one()
+        estimate = db.execute(select(DeviceLocationEstimate)).scalar_one()
+        assert device.latitude == pytest.approx(-6.226100)
+        assert device.longitude == pytest.approx(106.852900)
+        assert estimate.details["scanner_position_available"] is True
+        assert estimate.details["scanner_position_current"] is False

@@ -16,6 +16,7 @@ class Base(DeclarativeBase):
 
 settings = get_settings()
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
+SQLITE_POOL_SIZE = 4
 database_url = settings.resolved_database_url
 
 
@@ -28,7 +29,7 @@ def ensure_sqlite_directory(url: str) -> None:
 
 
 def engine_options(database_url: str) -> dict[str, object]:
-    """Use one waitable connection for the single-file SQLite local runner."""
+    """Bound SQLite concurrency while WAL keeps dashboard reads independent."""
     if not database_url.startswith("sqlite"):
         return {"pool_pre_ping": True, "future": True}
     return {
@@ -36,7 +37,7 @@ def engine_options(database_url: str) -> dict[str, object]:
             "check_same_thread": False,
             "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
         },
-        "pool_size": 1,
+        "pool_size": SQLITE_POOL_SIZE,
         "max_overflow": 0,
         "pool_timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
         "future": True,

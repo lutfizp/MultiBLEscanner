@@ -38,6 +38,32 @@ def load_env() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def truthy(value: str | None) -> bool:
+    return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT / path
+
+
+def tls_runtime() -> dict[str, Path] | None:
+    if not truthy(os.getenv("RUN_HTTPS", "false")):
+        return None
+    paths = {
+        "cert": runtime_path(os.getenv("RUN_TLS_CERTFILE", ".local/tls/localhost.pem")),
+        "key": runtime_path(os.getenv("RUN_TLS_KEYFILE", ".local/tls/localhost-key.pem")),
+        "ca": runtime_path(os.getenv("RUN_TLS_CA_FILE", ".local/tls/local-ca.pem")),
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "Local HTTPS files are missing. Run 'python3 setup_project.py https'. "
+            f"Missing: {', '.join(missing)}"
+        )
+    return paths
+
+
 def bootstrap_database() -> dict[str, object]:
     from alembic import command
     from alembic.config import Config
@@ -91,10 +117,17 @@ def main() -> None:
         host = os.getenv("RUN_HOST", "127.0.0.1")
         requested_port = int(os.getenv("RUN_PORT", "8000"))
         port = choose_port(host, requested_port)
+        tls = tls_runtime()
+        scheme = "https" if tls else "http"
         serial_process: subprocess.Popen[bytes] | None = None
 
-        def local_api_host() -> str:
+        def local_bridge_host() -> str:
             return "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+
+        def local_dashboard_host() -> str:
+            if host in {"0.0.0.0", "::", "127.0.0.1", "::1"}:
+                return "localhost"
+            return host
 
         def serial_enabled() -> bool:
             return os.getenv("ESP32_SERIAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -109,7 +142,7 @@ def main() -> None:
                     sys.executable,
                     str(ROOT / "serial_bridge.py"),
                     "--base-url",
-                    f"http://{local_api_host()}:{port}",
+                    f"{scheme}://{local_bridge_host()}:{port}",
                     "--scanner-id",
                     str(seed_result["scanner_id"]),
                     "--token",
@@ -118,6 +151,11 @@ def main() -> None:
                     os.getenv("ESP32_SERIAL_PORT", "auto"),
                     "--baud",
                     os.getenv("ESP32_SERIAL_BAUD", "115200"),
+                    *(
+                        ["--ca-file", str(tls["ca"])]
+                        if tls
+                        else []
+                    ),
                 ],
                 cwd=str(ROOT),
             )
@@ -125,7 +163,8 @@ def main() -> None:
         print("Bluetooth Scanner ready")
         if port != requested_port:
             print(f"Requested port {requested_port} is busy. Using {port} instead.")
-        print(f"Dashboard: http://{local_api_host()}:{port}/dashboard/")
+        print(f"Dashboard: {scheme}://{local_dashboard_host()}:{port}/dashboard/")
+        print(f"HTTPS: {'enabled with local trusted CA' if tls else 'disabled'}")
         print("Mode: real ESP32 over USB serial.")
         print(f"Scanner ID: {seed_result['scanner_id']}")
         print(f"Serial bridge: {'enabled' if serial_enabled() else 'disabled'}")
@@ -134,17 +173,25 @@ def main() -> None:
 
         import uvicorn
 
-        from backend.app.realtime import broker
+        from backend.app.realtime import broker, tracking_broker
 
         class ScannerServer(uvicorn.Server):
             def handle_exit(self, sig: int, frame: object | None) -> None:
                 # Close long-lived SSE responses before Uvicorn waits for open
                 # HTTP connections, otherwise Ctrl+C can leave the runner lock.
                 broker.request_shutdown()
+                tracking_broker.request_shutdown()
                 super().handle_exit(sig, frame)
 
         threading.Thread(target=start_serial_bridge, daemon=True).start()
-        config = uvicorn.Config("backend.app.main:app", host=host, port=port, reload=False)
+        config = uvicorn.Config(
+            "backend.app.main:app",
+            host=host,
+            port=port,
+            reload=False,
+            ssl_certfile=str(tls["cert"]) if tls else None,
+            ssl_keyfile=str(tls["key"]) if tls else None,
+        )
         try:
             ScannerServer(config).run()
         except KeyboardInterrupt:

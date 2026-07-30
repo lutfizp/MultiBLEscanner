@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -24,6 +25,7 @@ TIME_SYNC_PREFIX = "@@BT_SCANNER_TIME@@"
 BRIDGE_ACK_PREFIX = "@@BT_SCANNER_ACK@@"
 BRIDGE_CONFIG_PREFIX = "@@BT_SCANNER_CONFIG@@"
 MIN_ESP32_PORT_SCORE = 40
+DEFAULT_BACKEND_TIMEOUT_SECONDS = 8.0
 
 
 class SerialLineReader:
@@ -32,18 +34,21 @@ class SerialLineReader:
     def __init__(self) -> None:
         self._pending = bytearray()
 
-    def feed(self, chunk: bytes) -> list[str]:
+    def feed(self, chunk: bytes) -> list[str | None]:
         if not chunk:
             return []
         self._pending.extend(chunk)
-        lines: list[str] = []
+        lines: list[str | None] = []
         while True:
             newline_index = self._pending.find(b"\n")
             if newline_index < 0:
                 break
             raw_line = bytes(self._pending[:newline_index])
             del self._pending[: newline_index + 1]
-            lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\r"))
+            try:
+                lines.append(raw_line.decode("utf-8").rstrip("\r"))
+            except UnicodeDecodeError:
+                lines.append(None)
         return lines
 
 
@@ -104,7 +109,26 @@ def resolve_serial_port(preferred: str) -> str:
     raise RuntimeError(f"No ESP32-like serial port found. Visible ports: {visible}")
 
 
-def send_to_backend(method: str, path: str, body: str, base_url: str, token: str, timeout: float) -> tuple[int, str]:
+def build_backend_ssl_context(base_url: str, ca_file: str | None) -> ssl.SSLContext | None:
+    if not base_url.lower().startswith("https://"):
+        return None
+    if ca_file:
+        ca_path = Path(ca_file).expanduser()
+        if not ca_path.is_file():
+            raise RuntimeError(f"Backend CA file does not exist: {ca_path}")
+        return ssl.create_default_context(cafile=str(ca_path))
+    return ssl.create_default_context()
+
+
+def send_to_backend(
+    method: str,
+    path: str,
+    body: str,
+    base_url: str,
+    token: str,
+    timeout: float,
+    ssl_context: ssl.SSLContext | None = None,
+) -> tuple[int, str]:
     method = method.upper()
     if not path.startswith("/"):
         path = "/" + path
@@ -119,12 +143,18 @@ def send_to_backend(method: str, path: str, body: str, base_url: str, token: str
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:
         response_body = response.read().decode("utf-8", errors="replace")
         return response.status, response_body
 
 
-def forward_frame(lines: list[str], base_url: str, token: str, timeout: float) -> tuple[int, str]:
+def forward_frame(
+    lines: list[str],
+    base_url: str,
+    token: str,
+    timeout: float,
+    ssl_context: ssl.SSLContext | None = None,
+) -> tuple[int, str]:
     if len(lines) < 2:
         return 0, ""
 
@@ -170,9 +200,34 @@ def forward_frame(lines: list[str], base_url: str, token: str, timeout: float) -
                 flush=True,
             )
             return 400, ""
+    if method == "POST" and path.endswith("/tracking-samples/batch"):
+        valid_tracking_batch = (
+            isinstance(parsed_body, dict)
+            and isinstance(parsed_body.get("batch_id"), str)
+            and bool(parsed_body["batch_id"].strip())
+            and isinstance(parsed_body.get("session_id"), str)
+            and bool(parsed_body["session_id"].strip())
+            and isinstance(parsed_body.get("samples"), list)
+            and bool(parsed_body["samples"])
+        )
+        if not valid_tracking_batch:
+            print(
+                "[serial] Dropping invalid tracking batch frame before HTTP: "
+                "batch_id, session_id, and at least one sample are required.",
+                flush=True,
+            )
+            return 400, ""
 
     try:
-        status, response_body = send_to_backend(method, path, body, base_url, token, timeout)
+        status, response_body = send_to_backend(
+            method,
+            path,
+            body,
+            base_url,
+            token,
+            timeout,
+            ssl_context,
+        )
         print(f"[serial] Forwarded {method} {path} ({len(body)} bytes) -> HTTP {status}", flush=True)
         return status, response_body
     except urllib.error.HTTPError as exc:
@@ -203,6 +258,7 @@ def run_bridge(args: argparse.Namespace) -> int:
         print("pyserial is required. Install it with: python3 -m pip install -r requirements.txt", flush=True)
         return 2
 
+    backend_ssl_context = build_backend_ssl_context(args.base_url, args.ca_file)
     while True:
         try:
             port = resolve_serial_port(args.port)
@@ -215,6 +271,7 @@ def run_bridge(args: argparse.Namespace) -> int:
                 print("[serial] ESP32 serial bridge connected. Waiting for BLE scan frames.", flush=True)
                 buffer: list[str] = []
                 in_bridge_frame = False
+                frame_has_invalid_utf8 = False
                 line_reader = SerialLineReader()
 
                 while True:
@@ -226,9 +283,14 @@ def run_bridge(args: argparse.Namespace) -> int:
                     if not raw_chunk:
                         continue
                     for line in line_reader.feed(raw_chunk):
+                        if line is None:
+                            if in_bridge_frame:
+                                frame_has_invalid_utf8 = True
+                            continue
                         if line == BRIDGE_START:
                             buffer = []
                             in_bridge_frame = True
+                            frame_has_invalid_utf8 = False
                             continue
                         if line == BRIDGE_END:
                             if not in_bridge_frame:
@@ -236,9 +298,23 @@ def run_bridge(args: argparse.Namespace) -> int:
                                 continue
                             in_bridge_frame = False
                             path = buffer[1].strip() if len(buffer) >= 2 else ""
-                            status, response_body = forward_frame(buffer, args.base_url, args.token, args.timeout)
+                            if frame_has_invalid_utf8:
+                                print(
+                                    "[serial] Dropping serial frame before HTTP: invalid UTF-8 bytes.",
+                                    flush=True,
+                                )
+                                status, response_body = 400, ""
+                            else:
+                                status, response_body = forward_frame(
+                                    buffer,
+                                    args.base_url,
+                                    args.token,
+                                    args.timeout,
+                                    backend_ssl_context,
+                                )
                             send_bridge_response(connection, status, response_body, path)
                             buffer = []
+                            frame_has_invalid_utf8 = False
                             continue
                         if in_bridge_frame:
                             buffer.append(line)
@@ -259,12 +335,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default=os.getenv("ESP32_SERIAL_PORT", "auto"))
     parser.add_argument("--baud", type=int, default=int(os.getenv("ESP32_SERIAL_BAUD", "115200")))
     parser.add_argument("--base-url", default=os.getenv("ESP32_BRIDGE_BASE_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--ca-file", default=os.getenv("ESP32_BRIDGE_CA_FILE"))
     parser.add_argument("--scanner-id", default=os.getenv("LOCAL_SCANNER_ID", "scn_dev_lab_001"))
     parser.add_argument(
         "--token",
         default=os.getenv("LOCAL_SCANNER_TOKEN") or os.getenv("SCANNER_TOKEN", ""),
     )
-    parser.add_argument("--timeout", type=float, default=float(os.getenv("ESP32_BRIDGE_TIMEOUT", "60")))
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.getenv("ESP32_BRIDGE_TIMEOUT", str(DEFAULT_BACKEND_TIMEOUT_SECONDS))),
+    )
     parser.add_argument(
         "--time-sync-interval",
         type=float,

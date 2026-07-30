@@ -1,0 +1,11 @@
+sample:
+  name: DF Bluetooth RSSI Scanner
+tests:
+  sample.bluetooth.df_rssi_scanner:
+    harness: bluetooth
+    platform_allow:
+      - nrf52840dongle/nrf52840
+      - nrf52840dongle_nrf52840
+    tags: bluetooth usb
+    integration_platforms:
+      - nrf52840dongle/nrf52840
