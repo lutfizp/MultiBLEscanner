@@ -1235,3 +1235,171 @@ Limits:
 - The default dashboard filter reduces rotating-address noise; it does not delete weak raw observations or claim that hidden broadcasts are fake.
 - Apple transition evidence can support an operator decision, but it cannot establish a permanent physical identity when the protocol exposes no stable identifier.
 - Firmware `1.5.0` behavior begins only after an explicit device flash. The next normal `run.py` startup applies database revision `0009`; neither operation was forced during this phase.
+
+## Phase: Supervised Continuous Scan And Bounded GATT Enrichment
+
+Changed:
+
+- Released firmware `1.6.0` with continuous asynchronous active scanning, per-window advertisement admission, radio-silence supervision, and automatic scan restart when NimBLE unexpectedly stops.
+- Added factual scanner telemetry for reset reason, heap and largest allocation block, scan starts and restarts, scan windows, callbacks, accepted observations, advertisement silence, queue high-water marks, GATT admission, GATT outcomes, and task stack headroom.
+- Replaced per-target GATT task allocation with one persistent worker to avoid repeated FreeRTOS stack allocation and heap fragmentation.
+- Limited automatic GATT work to sufficiently strong named or very-near unnamed connectable candidates, with a six-hour per-address cooldown, a sixty-second global interval, heap guards, and a six-second operation budget.
+- Made raw observation upload independent from GATT state. GATT results now use an idempotent scanner endpoint tied to the original `source_observation_id`, so enrichment cannot delay or fabricate an advertisement.
+- Reworked serial transport scheduling around hard heartbeat and configuration deadlines, bounded tracking bursts, independent raw batches, enrichment retries, and completion-based due times.
+- Replaced high-frequency deep copies of tracking target strings with a primitive scheduler snapshot, and bounded an unacknowledged enrichment result to five minutes so one invalid source cannot block future GATT work indefinitely.
+- Added heartbeat reset-reason persistence and regression coverage for the continuous radio path, persistent GATT worker, independent transport, enrichment idempotency, and managed firmware release configuration.
+
+Validation:
+
+- PlatformIO built firmware `1.6.0` successfully at 37.4% RAM and 50.2% flash usage.
+- Five focused firmware-contract, backend-enrichment, heartbeat-provenance, and setup tests passed.
+- The user-started backend and serial bridge were not stopped or restarted, and the ESP32 was not flashed.
+
+Limits:
+
+- General scanning pauses only for admitted GATT work because the installed ESP32 shares one BLE radio between discovery and connection procedures.
+- GATT remains opportunistic: many devices reject connections, require security, omit Device Information characteristics, or stop advertising before a connection is established.
+- Radio-silence recovery restarts the scan controller; reset reason and heap telemetry are still required to distinguish controller stalls from board resets or power faults during a hardware soak test.
+
+## Phase: Time-Window Signal Filtering And Adaptive Tracking Freshness
+
+Changed:
+
+- Replaced sample-count EMA tracking with a four-second capture-time median so bursty advertisements cannot dominate the displayed signal merely by arriving more frequently.
+- Replaced the fixed six-second stale threshold with a per-scanner adaptive window derived from recent p90 advertisement cadence and p90 capture-to-server latency.
+- Bounded adaptive freshness to 12–30 seconds, retaining responsiveness while avoiding stale/live oscillation when a real target advertises more slowly than six seconds.
+- Added the effective freshness window to each tracking assignment and the session response, together with explicit median and trend-window metadata.
+- Kept delayed and out-of-order samples as historical evidence while preventing them from updating live RSSI, device presence, or the current tracking state.
+- Added regression coverage for the minimum adaptive delay window, delayed-state isolation, four-second median behavior, and cadence-derived freshness.
+
+Validation:
+
+- All 14 tracking tests passed.
+- No operational tracking records, Bluetooth observations, scanner state, or running process were modified during validation.
+
+Limits:
+
+- Adaptive freshness determines when recent evidence is no longer live; it cannot make a device advertise while connected, sleeping, powered off, or outside radio coverage.
+- RSSI remains a noisy proximity signal. Median filtering reduces short multipath spikes but does not provide direction or an exact indoor coordinate from one scanner.
+
+## Phase: Tracking Stream Recovery And Capture-Time UI Freshness
+
+Changed:
+
+- Added tracking-session hydration after every successful SSE connection, including automatic browser reconnects.
+- Merged hydrated samples and scanner positions by their stable item IDs so missed events are recovered without duplicating data or replacing newer live items.
+- Changed dashboard freshness to use each sample's factual `observed_at` capture time instead of the browser event-arrival time.
+- Changed Signal Finder trend calculation from fixed sample counts to a four-second current window compared with the preceding twelve seconds.
+- Updated the dashboard fallback stale window from six to twelve seconds and subscribed live refresh to separately reported GATT enrichment events.
+- Added source-level regression coverage for SSE rehydration, history merging, capture-time freshness, time-window trend calculation, and stale defaults.
+
+Validation:
+
+- All 10 dashboard tests passed.
+- `node --check dashboard/app.js` completed successfully.
+- The active dashboard server was not restarted; validation used static source and automated tests only.
+
+Limits:
+
+- SSE remains best-effort transport rather than a durable event log. Rehydration recovers persisted tracking samples and positions after a gap, but an event that was never committed cannot be reconstructed.
+- Browser and server clocks must remain reasonably synchronized; the backend continues to mark materially delayed capture timestamps rather than presenting them as live.
+
+## Phase: Cross-Layer Contracts And Release Verification
+
+Changed:
+
+- Added host-side semantic validation for separate GATT-enrichment frames so incomplete serial JSON is rejected before reaching FastAPI and remains eligible for firmware retry.
+- Updated the maintained README, API reference, RSSI evidence notes, engineering guide, and operations guide for firmware `1.6.0`, continuous scan supervision, bounded GATT, adaptive freshness, and capture-time Signal Finder behavior.
+- Exposed the latest firmware, reset, radio, callback, heap, GATT, and transport heartbeat telemetry through Diagnostics and documented a real one-hour hardware acceptance gate.
+- Extended firmware contract tests to prevent reintroduction of blocking scans, per-device task creation, GATT-gated raw uploads, high-frequency tracking-string copies, and six-second dashboard defaults.
+
+Validation:
+
+- All 101 automated tests passed.
+- PlatformIO built firmware `1.6.0` successfully at 37.4% RAM and 50.2% flash usage after the final firmware changes.
+- Python bytecode compilation, dashboard JavaScript syntax validation, and `git diff --check` passed.
+- No migration was required because reset reason and enrichment storage use existing normalized database columns and tables.
+
+Limits:
+
+- Source verification cannot establish long-term radio stability. Heap plateau, scan callback continuity, restart reason, heartbeat cadence, and observation delivery must be measured after firmware `1.6.0` is flashed.
+- The existing user-started runner and its attached ESP32 were deliberately left untouched during build and test validation.
+
+## Phase: Hardware Activation Gate And Runtime Baseline
+
+Changed:
+
+- Defined the activation boundary between verified source code and deployed scanner firmware: the `1.6.0` binary is ready, but hardware acceptance starts only after an explicit flash.
+- Kept the existing runner, serial connection, operational database, and ESP32 state untouched while completing the release audit.
+- Recorded the required one-hour hardware checks in the operations guide, including callback continuity, scan restarts, reset reason, heap behavior, heartbeat deadlines, GATT outcomes, and observation delivery.
+
+Validation:
+
+- The release firmware artifact was produced successfully at `firmware/.pio/build/esp32dev/firmware.bin`.
+- Read-only runtime inspection showed the attached scanner still reporting firmware `1.4.1`; therefore no `1.6.0` hardware-soak result is claimed.
+- The active runtime showed repeated boot identities and declining free-heap samples under the old firmware, confirming that deployment and a fresh telemetry baseline are required before accepting the radio-stability fix.
+
+Limits:
+
+- Flashing requires exclusive access to the ESP32 serial port and must be coordinated with the currently user-owned runner.
+- No scanner reboot, firmware flash, server restart, fake observation, or operational database mutation was performed in this phase.
+
+## Phase: Sustained USB Ingestion And Boot-Safe Enrichment
+
+Changed:
+
+- Added migration `0010` and the `(scanner_id, observation_id)` observation index used by ingestion idempotency and separate GATT-report lookup. This replaces a growing per-scanner scan with an indexed point lookup.
+- Released firmware `1.6.9` with a bounded 96-observation RAM queue, 12-observation serial frames, a 32 KB transport-task stack, a 4 KB UART receive ring, and a 4 KB bounded control line.
+- Standardized the firmware, setup, runner, and bridge runtime at `230400` baud after sustained `460800` traffic produced corrupted serial JSON. PlatformIO upload now uses the conservative `115200` speed for this CP2102 board.
+- Added the scanner boot ID to heartbeat, batch, observation, and focus-batch identifiers. A reboot can no longer reuse a prior idempotency key and accidentally resolve a GATT report against an observation from another boot.
+- Preserved strict backend GATT provenance checks. The earlier mismatched report was rejected and never stored; boot-scoped source IDs remove its root cause instead of weakening address validation.
+- Removed successful per-request bridge logging, moved per-batch backend logging to debug level, and disabled Uvicorn access logging by default. Errors remain visible, while stdout backpressure can no longer be created by every normal scan upload in a supervised process.
+- Updated setup regression coverage and the maintained README, engineering guide, and operations guide for the deployed release, runtime baud, flash speed, queue bounds, boot-scoped IDs, and Signal Finder requirement.
+
+Validation:
+
+- The final automated suite passed all 108 tests. Python bytecode compilation, dashboard JavaScript syntax validation, and `git diff --check` also passed.
+- The operational database reports Alembic revision `0010` as both current and head. SQLite query planning uses `ix_observations_scanner_observation` for the ingestion lookup.
+- PlatformIO built firmware `1.6.9` at 94,084 bytes of RAM (28.7%) and 656,789 bytes of flash (50.1%). The built firmware artifact SHA-256 is `c6f720e17e01f298b5d7da7c878558a7046c54920d7e5f0a9eb33c7b290c8a0b`.
+- The attached ESP32-D0WD-V3 booted and reported `esp32-ble-scanner-1.6.9` with boot ID `boot-8cbc94a7dbcc-1fe8d697` over the real CP2102 USB path.
+- At uptime 313 seconds, hardware telemetry reported 12,923 radio callbacks, 1,490 admitted observations, 10 pending observations, zero dropped observations, zero transport failures, zero serial-control overflow, zero JSON overflow, zero oversized-observation drops, and zero processing errors.
+- Two GATT attempts completed successfully and two boot-scoped enrichment records were accepted without provenance rejection.
+- A real fixed Signal Finder session for `Okikitg` reached `live`, stored 14 chronological samples from `-78` to `-74 dBm`, and reported zero focused-sample drops. The unattended acceptance lease then expired normally.
+- No simulator, generated Bluetooth observation, placeholder scanner, fake device, or fabricated location was used. The runner and serial bridge were stopped after verification.
+
+Rejected intermediate configurations:
+
+- Six-observation serial frames could not drain dense admitted traffic fast enough.
+- Twelve-observation frames alone still filled the queue before the database idempotency index was added.
+- Runtime baud `460800` had adequate nominal throughput but produced malformed and corrupted frames during sustained transfer, so it is not the release configuration.
+- A first high-speed flash attempt lost the CP2102 transfer before final completion. The board was reflashed at the configured lower upload speed and accepted only after it reported the expected release through a real heartbeat.
+
+Limits:
+
+- This was a five-minute hardware acceptance, not the documented one-hour soak. Free heap remained above 56 KB at the final heartbeat with a 51 KB recorded minimum, but long-term heap plateau and USB stability still require the one-hour gate.
+- Two firmware ACK timeouts were counted: one before the bridge was ready and one transient timeout during the run. Retry recovery completed with zero dropped observations and zero transport failures; deployments must continue monitoring these counters.
+- The RAM queue is bounded and volatile. It handles temporary acknowledgement gaps but does not survive scanner power loss and is not durable offline storage.
+- GATT enrichment remains opportunistic and does not force pairing. A successful read enriches only the exact source observation; it does not establish a permanent identity for rotating private addresses.
+- One stationary ESP32 provides factual scanner-anchor and RSSI evidence, not an exact transmitter coordinate or left/right direction.
+
+## Phase: Louder DF-Style Signal Finder Audio
+
+Changed:
+
+- Compared both requested local references. `ESP32_BLETracker` exposes BLE state and RSSI but has no proximity-audio engine; `df-bluetooth` provides the applicable fixed-frequency looping-tone design.
+- Replaced the continuously changing 300–1200 Hz oscillator with a generated 0.4-second, 440 Hz mono sine buffer that loops for the active Signal Finder session.
+- Added the same 20 ms attack and 40 ms release shape used by the DF reference so each loop boundary reaches zero amplitude without an audible click.
+- Raised maximum Web Audio gain from `0.14` to `0.42` and changed the quiet `level^2` curve to `level^1.35`. Moderate signal levels are materially louder while output remains below digital clipping.
+- Kept sound state tied to factual tracking freshness. Mute, stale samples, non-live sessions, and released tracking state still drive gain to zero.
+- Kept the implementation dependency-free by generating the tone in Web Audio memory instead of adding a bundled audio file or frontend framework.
+
+Validation:
+
+- All 109 automated tests passed, including a new dashboard contract test for frequency, loop length, attack, release, gain cap, gain curve, and stale mute behavior.
+- Dashboard JavaScript syntax validation, Python bytecode compilation, and `git diff --check` passed.
+- No backend, serial bridge, ESP32 firmware, database record, scanner configuration, or Bluetooth observation was changed during this phase.
+
+Limits:
+
+- Safari still requires a user gesture before Web Audio can start. The existing Track Signal or Sound action supplies that gesture, but browser or operating-system output volume can still mute the result.
+- Tone loudness represents normalized RSSI proximity evidence only. It does not indicate direction, exact distance, or an exact device coordinate from one scanner.

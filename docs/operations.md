@@ -80,7 +80,7 @@ Important variables:
 | `RUN_HOST`, `RUN_PORT` | Local HTTP listener |
 | `ESP32_SERIAL_ENABLED` | Enables the local USB bridge |
 | `ESP32_SERIAL_PORT` | `auto` or an explicit serial device |
-| `ESP32_SERIAL_BAUD` | Firmware serial rate, currently 115200 |
+| `ESP32_SERIAL_BAUD` | Firmware serial rate, currently 460800 |
 | `ESP32_BRIDGE_TIMEOUT` | Local backend forwarding deadline; keep below the firmware ACK and presence-missing thresholds |
 
 Restart the runner after changing environment variables. Runtime system settings stored in the database do not replace environment values that are read during process startup.
@@ -174,7 +174,7 @@ Flash explicitly:
 python3 setup_project.py flash --port /dev/cu.usbserial-0001
 ```
 
-The generated `firmware/include/config.h` contains the scanner ID. Firmware `esp32-ble-scanner-1.5.0` reports hardware `esp32-d0wd-v3` for the detected board and uses NimBLE-Arduino 2.5.0. The bearer token is not compiled into firmware; it remains in `.env` on the bridge host. Build does not modify the board; use the explicit `flash` target before expecting the dedicated transport task or weak-RF capture behavior at runtime.
+The generated `firmware/include/config.h` contains the scanner ID. Firmware `esp32-ble-scanner-1.6.9` reports hardware `esp32-d0wd-v3` and reset reason, and uses NimBLE-Arduino 2.5.0. Firmware runtime and `ESP32_SERIAL_BAUD` must both remain at `230400`; PlatformIO flashes this CP2102 board at the more conservative `115200` upload speed. The current non-PSRAM board uses a bounded 96-observation queue, 12-observation serial frames, and a 32 KB transport-task stack. Its 4 KB UART receive ring preserves complete focused-tracking configuration and acknowledgement lines; `serial_control_overflow_count` must remain zero. Every message, batch, observation, and focus-batch ID contains the current boot ID, preventing a reset from reusing an earlier idempotency key. The bearer token is not compiled into firmware; it remains in `.env` on the bridge host. Build does not modify the board; use the explicit `flash` target before expecting continuous scan supervision, bounded GATT, or the deadline-aware transport scheduler at runtime.
 
 After flashing, start `run.py` and verify this sequence:
 
@@ -184,6 +184,21 @@ After flashing, start `run.py` and verify this sequence:
 4. observation batches receive HTTP 200;
 5. scanner status becomes online;
 6. diagnostics counters increase without processing-error growth.
+
+### One-Hour Hardware Acceptance
+
+Keep the real scanner, target device, serial bridge, and backend running for at least one hour after flashing. Use the Diagnostics view or `/api/diagnostics`; do not inject generated observations.
+
+- `firmware_version` remains `esp32-ble-scanner-1.6.8` and the heartbeat `boot_id` does not change.
+- `scan_callback_count`, `scan_window_count`, and accepted-observation count continue increasing. A heartbeat with a growing last-advertisement age and unchanged callback count identifies radio silence independently from backend filtering.
+- `scan_restart_count` may increase after an actual controller stop or a 90-second callback silence, but must not increase every window.
+- free heap and largest free block may settle after startup and the first GATT attempt, but must not continue a one-way decline across the hour. The GATT heap guards require at least 70 KB free heap and a 20 KB largest block before a new attempt.
+- heartbeat arrival remains comfortably inside the 90-second scanner timeout and transport timeout/failure counters do not grow continuously.
+- temporary startup backlog declines instead of remaining at the queue limit. `transport_backlog_drain_count` may increase while acknowledged frames catch up, but `dropped_observations` must not continue rising after the queue settles. `upload_json_overflow_count` may record an adaptive retry; `upload_oversized_observation_drop_count` must normally remain zero.
+- observation batches continue after GATT success, rejection, timeout, and tracking start/stop. GATT failures are peripheral evidence, not scanner-offline events.
+- focused tracking receives chronological samples, reports its effective 12-30 second freshness window, and recovers persisted history after an SSE reconnect.
+
+Reject the release for that board if the boot ID changes unexpectedly, callback progress stops while heartbeat continues, heap continues falling, or observation delivery remains stopped after scan supervision restarts NimBLE.
 
 ## USB Diagnosis
 
@@ -218,7 +233,7 @@ Scanner-position updates alone never move device records. Each newer accepted BL
 
 ## Signal Finder Operation
 
-Signal Finder requires firmware `1.5.0`, an online scanner, and a logical device with a real stored BLE observation. Heartbeats cannot be selected as targets.
+Signal Finder requires firmware `1.6.9`, an online scanner, and a logical device with a real stored BLE observation. Heartbeats cannot be selected as targets.
 
 1. Open the test console's Devices or Locations view.
 2. Select a stored Bluetooth device by row, marker, anchored-device entry, or map selector.
@@ -290,9 +305,9 @@ Database downgrade is not the normal rollback path. Restore the pre-upgrade back
 | Bridge drops malformed JSON | Serial frame was incomplete/corrupted | Confirm current firmware build and serial stability |
 | SQLite `database is locked` | Competing writer or long transaction | Stop duplicate tools/processes; do not add concurrent local writers |
 | Tracking start returns HTTP 409 | Scanner already has another active target | Stop that session or allow its 30-second lease to expire |
-| Signal Finder remains `arming` | Firmware has not fetched the updated configuration | Confirm firmware 1.5.0, config HTTP 200, scanner ID, and transport heartbeat counters |
+| Signal Finder remains `arming` | Firmware has not fetched the updated configuration | Confirm firmware 1.6.9, config HTTP 200, scanner ID, `serial_control_overflow_count`, and transport heartbeat counters |
 | Signal Finder waits for advertisement | Accepted address/type is not currently advertising | Keep normal scanning active; inspect the device's latest accepted identities |
-| Signal Finder becomes stale | No fresh chronological target sample arrived within the six-second USB freshness window | Check target availability, RSSI, scanner status, dropped focus samples, and serial health |
+| Signal Finder becomes stale | No fresh chronological target sample arrived within its adaptive 12-30 second freshness window | Check the reported effective window, target advertising cadence, RSSI, scanner status, dropped focus samples, and transport latency |
 | GATT status is `operation_timeout` | Peripheral did not finish enrichment within the pipeline deadline | Treat the observation as valid advertisement evidence; inspect later attempts without increasing the deadline blindly |
 | GATT status is `security_required` | Characteristic requires authentication or encryption | No value was read and firmware did not initiate pairing |
 | Location reports blocked permission | Browser or macOS denied geolocation | Allow location for the dashboard origin and enable Location Services for the browser; a denial is never bypassed |
@@ -305,7 +320,7 @@ Database downgrade is not the normal rollback path. Restore the pre-upgrade back
 | Distance appears implausible | Literature baseline is outside its validated environment/range | Treat as radial model output; inspect RSSI and physical obstructions |
 | Offline point remains on map | Last accepted BLE-observation anchor is intentionally retained | A newer accepted observation at the same moved scanner or another scanner moves it |
 | Test console stops live refreshing | SSE is disconnected or queue notification was lost | Reload; durable backend state remains available through HTTP |
-| Scan cycles still pause around a failed ACK | Board is running firmware older than 1.5.0 or has another radio-side failure | Flash 1.5.0, then inspect transport last path/status/duration, timeout count, USB resets, and dropped buffers |
+| Scan cycles stop while heartbeats continue | Board is running firmware older than 1.6.8 or NimBLE stopped producing callbacks | Flash 1.6.8, then inspect radio state, callback count, last-advertisement age, scan restart count, heap, reset reason, and transport telemetry |
 
 ## Incident Data
 

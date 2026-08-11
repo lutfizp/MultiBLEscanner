@@ -35,10 +35,10 @@ Before ten observations are available for a scanner, the sequence metric is expl
 Signal Finder uses a separate relative display scale:
 
 ```text
-level = clamp((EMA_RSSI - (-85)) / ((-45) - (-85)), 0, 1)
+level = clamp((MEDIAN_RSSI - (-85)) / ((-45) - (-85)), 0, 1)
 ```
 
-The EMA coefficient is `0.35`. Firmware can produce at most one sample per accepted target every 200 ms. The backend uses a six-second freshness window because real CP2102 acceptance measurements reached the server 3.1-4.5 seconds after RF capture while normal observation traffic shared the serial link. Older or out-of-order samples remain stored but are excluded from live feedback. Trend text compares two consecutive five-sample medians and reports a change only at 3 dB or more.
+Firmware can produce at most one sample per accepted target every 200 ms. The backend takes the median of current, non-delayed samples captured within the preceding four seconds. Freshness is calculated per scanner from the recent p90 advertisement cadence and p90 capture-to-server latency, then bounded to 12-30 seconds. Delayed or out-of-order samples remain stored but do not update live RSSI or presence. Trend text compares the latest four-second RSSI median with the preceding twelve-second window and reports a change only at 3 dB or more.
 
 The `-85` and `-45 dBm` bounds control a meter and audio tone. They are not a distance calibration and do not alter the journal radial model, normal movement status, or stored location. A stronger level means only that the selected accepted identity was measured more strongly at that scanner.
 

@@ -217,6 +217,28 @@ def forward_frame(
                 flush=True,
             )
             return 400, ""
+    if method == "POST" and path.endswith("/enrichments"):
+        valid_enrichment = (
+            isinstance(parsed_body, dict)
+            and isinstance(parsed_body.get("report_id"), str)
+            and bool(parsed_body["report_id"].strip())
+            and isinstance(parsed_body.get("source_observation_id"), str)
+            and bool(parsed_body["source_observation_id"].strip())
+            and isinstance(parsed_body.get("address"), str)
+            and bool(parsed_body["address"].strip())
+            and isinstance(parsed_body.get("address_type"), str)
+            and bool(parsed_body["address_type"].strip())
+            and isinstance(parsed_body.get("gatt_enrichment"), dict)
+            and isinstance(parsed_body["gatt_enrichment"].get("status"), str)
+            and bool(parsed_body["gatt_enrichment"]["status"].strip())
+        )
+        if not valid_enrichment:
+            print(
+                "[serial] Dropping invalid GATT enrichment frame before HTTP: "
+                "source identity and enrichment status are required.",
+                flush=True,
+            )
+            return 400, ""
 
     try:
         status, response_body = send_to_backend(
@@ -228,7 +250,6 @@ def forward_frame(
             timeout,
             ssl_context,
         )
-        print(f"[serial] Forwarded {method} {path} ({len(body)} bytes) -> HTTP {status}", flush=True)
         return status, response_body
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
@@ -333,7 +354,7 @@ def run_bridge(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Forward ESP32 USB serial bridge frames to the local backend.")
     parser.add_argument("--port", default=os.getenv("ESP32_SERIAL_PORT", "auto"))
-    parser.add_argument("--baud", type=int, default=int(os.getenv("ESP32_SERIAL_BAUD", "115200")))
+    parser.add_argument("--baud", type=int, default=int(os.getenv("ESP32_SERIAL_BAUD", "230400")))
     parser.add_argument("--base-url", default=os.getenv("ESP32_BRIDGE_BASE_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--ca-file", default=os.getenv("ESP32_BRIDGE_CA_FILE"))
     parser.add_argument("--scanner-id", default=os.getenv("LOCAL_SCANNER_ID", "scn_dev_lab_001"))

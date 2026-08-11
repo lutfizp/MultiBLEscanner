@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from math import ceil
 from statistics import median
 from typing import Any
 
@@ -25,8 +26,12 @@ from .services import create_event, serialize_datetime
 
 
 TRACKING_LEASE_SECONDS = 30
-TRACKING_SAMPLE_STALE_SECONDS = 6
-TRACKING_EMA_ALPHA = 0.35
+TRACKING_MEDIAN_WINDOW_SECONDS = 4
+TRACKING_TREND_CURRENT_SECONDS = 4
+TRACKING_TREND_PREVIOUS_SECONDS = 12
+TRACKING_STALE_MIN_SECONDS = 12
+TRACKING_STALE_MAX_SECONDS = 30
+TRACKING_STALE_HISTORY_LIMIT = 60
 TRACKING_SIGNAL_FAR_RSSI = -85.0
 TRACKING_SIGNAL_NEAR_RSSI = -45.0
 TRACKING_TARGET_LIMIT = 8
@@ -60,6 +65,78 @@ def normalize_address(value: str) -> str:
 def signal_level(smoothed_rssi: float) -> float:
     span = TRACKING_SIGNAL_NEAR_RSSI - TRACKING_SIGNAL_FAR_RSSI
     return max(0.0, min(1.0, (smoothed_rssi - TRACKING_SIGNAL_FAR_RSSI) / span))
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def tracking_stale_seconds(db: Session, assignment: DeviceTrackingScanner) -> int:
+    recent = list(
+        reversed(
+            db.execute(
+                select(DeviceTrackingSample)
+                .where(DeviceTrackingSample.assignment_id == assignment.id)
+                .order_by(desc(DeviceTrackingSample.observed_at))
+                .limit(TRACKING_STALE_HISTORY_LIMIT)
+            ).scalars().all()
+        )
+    )
+    capture_gaps: list[float] = []
+    for previous, current in zip(recent, recent[1:]):
+        if previous.boot_id != current.boot_id:
+            continue
+        gap = (ensure_utc(current.observed_at) - ensure_utc(previous.observed_at)).total_seconds()
+        if 0 < gap <= TRACKING_STALE_MAX_SECONDS * 2:
+            capture_gaps.append(gap)
+    transport_delays = [
+        max(
+            0.0,
+            (ensure_utc(sample.server_received_at) - ensure_utc(sample.observed_at)).total_seconds(),
+        )
+        for sample in recent
+    ]
+    cadence_p90 = _percentile(capture_gaps, 0.90) or 0.0
+    transport_p90 = _percentile(transport_delays, 0.90) or 0.0
+    adaptive = max(
+        TRACKING_STALE_MIN_SECONDS,
+        cadence_p90 * 2.0,
+        transport_p90 + TRACKING_MEDIAN_WINDOW_SECONDS,
+    )
+    return int(min(TRACKING_STALE_MAX_SECONDS, ceil(adaptive)))
+
+
+def tracking_window_median(
+    db: Session,
+    assignment: DeviceTrackingScanner,
+    *,
+    observed_at: datetime,
+    boot_id: str,
+    rssi: int,
+) -> float:
+    window_start = observed_at - timedelta(seconds=TRACKING_MEDIAN_WINDOW_SECONDS)
+    values = list(
+        db.execute(
+            select(DeviceTrackingSample.rssi).where(
+                DeviceTrackingSample.assignment_id == assignment.id,
+                DeviceTrackingSample.boot_id == boot_id,
+                DeviceTrackingSample.observed_at >= window_start,
+                DeviceTrackingSample.observed_at <= observed_at,
+                DeviceTrackingSample.delayed.is_(False),
+            )
+        ).scalars()
+    )
+    values.append(rssi)
+    return float(median(values))
 
 
 def _active_session(db: Session, session_id: str) -> DeviceTrackingSession:
@@ -140,6 +217,14 @@ def serialize_tracking_session(
     include_history: bool = False,
 ) -> dict[str, Any]:
     assignments = _assignments(db, session.id)
+    stale_by_assignment = {
+        assignment.id: tracking_stale_seconds(db, assignment)
+        for assignment in assignments
+    }
+    session_stale_seconds = max(
+        stale_by_assignment.values(),
+        default=TRACKING_STALE_MIN_SECONDS,
+    )
     result: dict[str, Any] = {
         "id": session.id,
         "logical_device_id": session.logical_device_id,
@@ -163,15 +248,21 @@ def serialize_tracking_session(
                 "last_sample_at": serialize_datetime(assignment.last_sample_at),
                 "smoothed_rssi": assignment.smoothed_rssi,
                 "dropped_samples": assignment.dropped_samples,
+                "sample_stale_seconds": stale_by_assignment[assignment.id],
             }
             for assignment in assignments
         ],
         "lease_seconds": TRACKING_LEASE_SECONDS,
-        "sample_stale_seconds": TRACKING_SAMPLE_STALE_SECONDS,
+        "sample_stale_seconds": session_stale_seconds,
         "signal_scale": {
             "far_rssi": TRACKING_SIGNAL_FAR_RSSI,
             "near_rssi": TRACKING_SIGNAL_NEAR_RSSI,
-            "ema_alpha": TRACKING_EMA_ALPHA,
+            "filter": "time_window_median",
+            "median_window_seconds": TRACKING_MEDIAN_WINDOW_SECONDS,
+            "trend_current_seconds": TRACKING_TREND_CURRENT_SECONDS,
+            "trend_previous_seconds": TRACKING_TREND_PREVIOUS_SECONDS,
+            "stale_min_seconds": TRACKING_STALE_MIN_SECONDS,
+            "stale_max_seconds": TRACKING_STALE_MAX_SECONDS,
         },
     }
     if include_history:
@@ -622,6 +713,7 @@ def ingest_tracking_samples(
     rejected = 0
     live_samples: list[dict[str, Any]] = []
     received_at = utcnow()
+    stale_seconds = tracking_stale_seconds(db, assignment)
 
     for item in payload.samples:
         if item.sample_id in existing_ids:
@@ -644,13 +736,16 @@ def ingest_tracking_samples(
             or assignment.last_sequence is None
             or item.sequence > assignment.last_sequence
         )
-        delayed = age_seconds > TRACKING_SAMPLE_STALE_SECONDS or not sequence_is_current
+        delayed = age_seconds > stale_seconds or not sequence_is_current
         if assignment.last_boot_id != item.boot_id or assignment.smoothed_rssi is None:
             smoothed = float(item.rssi)
         elif sequence_is_current:
-            smoothed = (
-                TRACKING_EMA_ALPHA * float(item.rssi)
-                + (1.0 - TRACKING_EMA_ALPHA) * assignment.smoothed_rssi
+            smoothed = tracking_window_median(
+                db,
+                assignment,
+                observed_at=observed_at,
+                boot_id=item.boot_id,
+                rssi=item.rssi,
             )
         else:
             smoothed = assignment.smoothed_rssi
@@ -682,16 +777,20 @@ def ingest_tracking_samples(
         if sequence_is_current:
             assignment.last_boot_id = item.boot_id
             assignment.last_sequence = item.sequence
-            assignment.last_sample_at = observed_at
-            assignment.smoothed_rssi = smoothed
-            _apply_tracking_presence_evidence(
-                db,
-                session=session,
-                scanner=scanner,
-                identity=identity,
-                observed_at=observed_at,
-                smoothed_rssi=smoothed,
-            )
+            if not delayed:
+                assignment.last_sample_at = max(
+                    ensure_utc(assignment.last_sample_at) if assignment.last_sample_at else observed_at,
+                    observed_at,
+                )
+                assignment.smoothed_rssi = smoothed
+                _apply_tracking_presence_evidence(
+                    db,
+                    session=session,
+                    scanner=scanner,
+                    identity=identity,
+                    observed_at=observed_at,
+                    smoothed_rssi=smoothed,
+                )
         if not delayed:
             assignment.state = "live"
             session.state = "live"
@@ -777,7 +876,7 @@ def refresh_tracking_states(db: Session) -> list[dict[str, Any]]:
             if (
                 assignment.last_sample_at is not None
                 and (now - ensure_utc(assignment.last_sample_at)).total_seconds()
-                > TRACKING_SAMPLE_STALE_SECONDS
+                > tracking_stale_seconds(db, assignment)
                 and assignment.state == "live"
             ):
                 assignment.state = "stale"

@@ -55,16 +55,23 @@ const state = {
     mode: "fixed",
     soundEnabled: true,
     audioContext: null,
-    oscillator: null,
+    audioSource: null,
     gain: null,
     notice: "",
     positionSending: false,
     shouldFitMap: false,
+    rehydrateGeneration: 0,
   },
 };
 
 const TRACKING_POSITION_INTERVAL_MS = 3000;
 const TRACKING_POSITION_MOVE_M = 2;
+const FINDER_TONE_FREQUENCY_HZ = 440;
+const FINDER_TONE_DURATION_SECONDS = 0.4;
+const FINDER_TONE_ATTACK_SECONDS = 0.02;
+const FINDER_TONE_RELEASE_SECONDS = 0.04;
+const FINDER_TONE_MAX_GAIN = 0.42;
+const FINDER_TONE_GAIN_EXPONENT = 1.35;
 const GPS_WATCH_OPTIONS = {
   enableHighAccuracy: true,
   maximumAge: 5000,
@@ -1077,9 +1084,30 @@ function medianValue(values) {
 }
 
 function trackingTrend(samples) {
-  const current = samples.slice(-5).map((sample) => Number(sample.smoothed_rssi));
-  const previous = samples.slice(-10, -5).map((sample) => Number(sample.smoothed_rssi));
-  if (current.length < 5 || previous.length < 5) {
+  const scale = state.tracking.session?.signal_scale || {};
+  const currentWindowMs = (scale.trend_current_seconds || 4) * 1000;
+  const previousWindowMs = (scale.trend_previous_seconds || 12) * 1000;
+  const timed = samples
+    .map((sample) => ({
+      observedAt: new Date(sample.observed_at).getTime(),
+      rssi: Number(sample.rssi),
+    }))
+    .filter((sample) => Number.isFinite(sample.observedAt) && Number.isFinite(sample.rssi))
+    .sort((left, right) => left.observedAt - right.observedAt);
+  const latestAt = timed.at(-1)?.observedAt;
+  if (!latestAt) {
+    return { label: "Collecting signal window", delta: null };
+  }
+  const current = timed
+    .filter((sample) => sample.observedAt > latestAt - currentWindowMs)
+    .map((sample) => sample.rssi);
+  const previous = timed
+    .filter((sample) => (
+      sample.observedAt <= latestAt - currentWindowMs
+      && sample.observedAt > latestAt - currentWindowMs - previousWindowMs
+    ))
+    .map((sample) => sample.rssi);
+  if (!current.length || !previous.length) {
     return { label: "Collecting signal window", delta: null };
   }
   const delta = medianValue(current) - medianValue(previous);
@@ -1088,10 +1116,29 @@ function trackingTrend(samples) {
   return { label: `Signal steady within ${formatNumber(Math.abs(delta), 1)} dB`, delta };
 }
 
+function createFinderToneBuffer(context) {
+  const frameCount = Math.max(1, Math.floor(context.sampleRate * FINDER_TONE_DURATION_SECONDS));
+  const attackFrames = Math.max(1, Math.floor(context.sampleRate * FINDER_TONE_ATTACK_SECONDS));
+  const releaseFrames = Math.max(1, Math.floor(context.sampleRate * FINDER_TONE_RELEASE_SECONDS));
+  const releaseStart = Math.max(attackFrames, frameCount - releaseFrames);
+  const buffer = context.createBuffer(1, frameCount, context.sampleRate);
+  const samples = buffer.getChannelData(0);
+
+  for (let index = 0; index < frameCount; index += 1) {
+    let envelope = 1;
+    if (index < attackFrames) envelope = index / attackFrames;
+    else if (index >= releaseStart) envelope = Math.max(0, (frameCount - index - 1) / releaseFrames);
+    samples[index] = envelope * Math.sin(
+      2 * Math.PI * FINDER_TONE_FREQUENCY_HZ * (index / context.sampleRate),
+    );
+  }
+  return buffer;
+}
+
 function prepareFinderAudio() {
   const tracking = state.tracking;
   if (tracking.audioContext) {
-    tracking.audioContext.resume();
+    tracking.audioContext.resume().catch(() => {});
     tracking.soundEnabled = true;
     return true;
   }
@@ -1101,17 +1148,17 @@ function prepareFinderAudio() {
     return false;
   }
   const context = new AudioContext();
-  const oscillator = context.createOscillator();
+  const source = context.createBufferSource();
   const gain = context.createGain();
-  oscillator.type = "sine";
-  oscillator.frequency.value = 320;
+  source.buffer = createFinderToneBuffer(context);
+  source.loop = true;
   gain.gain.value = 0;
-  oscillator.connect(gain);
+  source.connect(gain);
   gain.connect(context.destination);
-  oscillator.start();
-  context.resume();
+  source.start();
+  context.resume().catch(() => {});
   tracking.audioContext = context;
-  tracking.oscillator = oscillator;
+  tracking.audioSource = source;
   tracking.gain = gain;
   tracking.soundEnabled = true;
   return true;
@@ -1119,13 +1166,13 @@ function prepareFinderAudio() {
 
 function updateFinderAudio(level, stale = false) {
   const tracking = state.tracking;
-  if (!tracking.audioContext || !tracking.gain || !tracking.oscillator) return;
+  if (!tracking.audioContext || !tracking.gain || !tracking.audioSource) return;
   const now = tracking.audioContext.currentTime;
   const audibleLevel = tracking.soundEnabled && !stale
     ? Math.max(0, Math.min(1, Number(level) || 0))
     : 0;
-  tracking.oscillator.frequency.setTargetAtTime(300 + audibleLevel * 900, now, 0.04);
-  tracking.gain.gain.setTargetAtTime(0.14 * audibleLevel ** 2, now, 0.08);
+  const outputGain = FINDER_TONE_MAX_GAIN * audibleLevel ** FINDER_TONE_GAIN_EXPONENT;
+  tracking.gain.gain.setTargetAtTime(outputGain, now, 0.06);
 }
 
 function releaseFinderAudio() {
@@ -1135,10 +1182,18 @@ function releaseFinderAudio() {
   }
   if (tracking.audioContext) {
     const context = tracking.audioContext;
-    setTimeout(() => context.close().catch(() => {}), 120);
+    const source = tracking.audioSource;
+    setTimeout(() => {
+      try {
+        source?.stop();
+      } catch (_error) {
+        // The source may already be stopped while the browser is unloading.
+      }
+      context.close().catch(() => {});
+    }, 120);
   }
   tracking.audioContext = null;
-  tracking.oscillator = null;
+  tracking.audioSource = null;
   tracking.gain = null;
 }
 
@@ -1156,6 +1211,7 @@ function stopTrackingRuntime() {
   tracking.positionWatchId = null;
   tracking.lastPosition = null;
   tracking.positionSending = false;
+  tracking.rehydrateGeneration += 1;
   updateFinderAudio(0, true);
 }
 
@@ -1225,7 +1281,13 @@ function handleTrackingSample(sample) {
       .slice(-240)
       .sort((left, right) => new Date(left.observed_at) - new Date(right.observed_at));
   }
-  tracking.lastReceivedAt = Date.now();
+  const observedAt = new Date(sample.observed_at).getTime();
+  if (Number.isFinite(observedAt)) {
+    tracking.lastReceivedAt = Math.max(
+      tracking.lastReceivedAt,
+      Math.min(Date.now(), observedAt),
+    );
+  }
   tracking.session.state = "live";
   renderSignalFinder();
   renderTrackingOverlay();
@@ -1249,14 +1311,50 @@ function handleTrackingSessionState(update) {
   renderTrackingOverlay();
 }
 
+async function rehydrateTrackingSession(sessionId) {
+  const tracking = state.tracking;
+  const generation = ++tracking.rehydrateGeneration;
+  try {
+    const hydrated = await api(`/api/tracking-sessions/${encodeURIComponent(sessionId)}`);
+    if (generation !== tracking.rehydrateGeneration || tracking.session?.id !== sessionId) return;
+    const sampleMap = new Map(
+      [...tracking.samples, ...(hydrated.samples || []).filter((sample) => !sample.delayed)]
+        .map((sample) => [sample.sample_id, sample]),
+    );
+    const positionMap = new Map(
+      [...tracking.positions, ...(hydrated.positions || [])]
+        .map((position) => [position.position_id, position]),
+    );
+    tracking.samples = [...sampleMap.values()]
+      .sort((left, right) => new Date(left.observed_at) - new Date(right.observed_at))
+      .slice(-240);
+    tracking.positions = [...positionMap.values()]
+      .sort((left, right) => new Date(left.observed_at) - new Date(right.observed_at))
+      .slice(-500);
+    tracking.session = { ...tracking.session, ...hydrated };
+    const latestObservedAt = new Date(tracking.samples.at(-1)?.observed_at).getTime();
+    tracking.lastReceivedAt = Number.isFinite(latestObservedAt)
+      ? Math.min(Date.now(), latestObservedAt)
+      : 0;
+    tracking.notice = "";
+    renderSignalFinder();
+    renderTrackingOverlay();
+  } catch (error) {
+    if (generation !== tracking.rehydrateGeneration || tracking.session?.id !== sessionId) return;
+    tracking.notice = `Live history sync failed: ${error.message}`;
+    renderSignalFinder();
+  }
+}
+
 function connectTrackingEvents(sessionId) {
   const tracking = state.tracking;
   if (tracking.source) tracking.source.close();
   const source = new EventSource(`/api/tracking-sessions/${encodeURIComponent(sessionId)}/events`);
   tracking.source = source;
   source.addEventListener("connected", () => {
-    tracking.notice = "";
+    tracking.notice = "Synchronizing live history";
     renderSignalFinder();
+    rehydrateTrackingSession(sessionId);
   });
   source.addEventListener("tracking_sample", (event) => handleTrackingSample(eventPayload(event)));
   source.addEventListener("scanner_position", (event) => {
@@ -1393,9 +1491,12 @@ async function startSignalFinder(device, mode = "fixed") {
   if (
     latestSample
     && Date.now() - new Date(latestSample.observed_at).getTime()
-      <= (hydrated.sample_stale_seconds || 6) * 1000
+      <= (hydrated.sample_stale_seconds || 12) * 1000
   ) {
-    state.tracking.lastReceivedAt = Date.now();
+    state.tracking.lastReceivedAt = Math.min(
+      Date.now(),
+      new Date(latestSample.observed_at).getTime(),
+    );
   }
   connectTrackingEvents(hydrated.id);
   state.tracking.leaseTimer = setInterval(renewTrackingLease, 10000);
@@ -1426,7 +1527,7 @@ function renderSignalFinder() {
   if (!session || !tracking.device) return;
   $("#signalFinder").classList.remove("hidden");
   const latest = tracking.samples.at(-1);
-  const staleAfterMs = (session.sample_stale_seconds || 6) * 1000;
+  const staleAfterMs = (session.sample_stale_seconds || 12) * 1000;
   const stale = !latest
     || !tracking.lastReceivedAt
     || Date.now() - tracking.lastReceivedAt > staleAfterMs;
@@ -1459,7 +1560,7 @@ function renderSignalFinder() {
   const stateMessages = {
     arming: "Focus command pending at the assigned scanner",
     waiting_for_advertisement: "Scanner armed; waiting for an accepted target identity",
-    stale: `No accepted target advertisement in the last ${session.sample_stale_seconds || 6} seconds`,
+    stale: `No accepted target advertisement in the last ${session.sample_stale_seconds || 12} seconds`,
     scanner_offline: "Assigned scanner is offline",
     identity_changed: "Accepted target identities changed; scanner configuration is refreshing",
     expired: "Tracking lease expired",
@@ -2092,6 +2193,8 @@ function renderDiagnostics() {
   const processing = data.processing || {};
   const identities = data.identity_counts || {};
   const browserLocation = data.browser_location || {};
+  const latestHeartbeat = data.latest_heartbeat || {};
+  const scannerHealth = latestHeartbeat.health || {};
   const scannerPosition = (data.scanner_positions || []).find(
     (position) => position.scanner_id === localScannerId(),
   );
@@ -2105,7 +2208,26 @@ function renderDiagnostics() {
     ${kv("Randomized identities", identities.randomized_address_identities ?? 0)}
     ${kv("Logical devices", identities.logical_devices ?? 0)}
     ${kv("Identity correlations", identities.identity_correlations ?? 0)}
-    ${kv("Latest heartbeat", data.latest_heartbeat ? formatDate(data.latest_heartbeat.received_at) : "-")}
+    ${kv("Latest heartbeat", latestHeartbeat.received_at ? formatDate(latestHeartbeat.received_at) : "-")}
+    ${kv("Firmware", latestHeartbeat.firmware_version || "-")}
+    ${kv("Reset reason", scannerHealth.reset_reason || "-")}
+    ${kv("Radio", scannerHealth.radio_state || "not reported")}
+    ${kv("Scan callbacks", scannerHealth.scan_callback_count ?? "-")}
+    ${kv("Accepted observations", scannerHealth.scan_accepted_observation_count ?? "-")}
+    ${kv("Scan restarts", scannerHealth.scan_restart_count ?? "-")}
+    ${kv("Last advertisement age", scannerHealth.last_advertisement_age_ms === undefined ? "-" : `${formatNumber(scannerHealth.last_advertisement_age_ms / 1000, 1)} s`)}
+    ${kv("Free heap", scannerHealth.free_heap === undefined ? "-" : `${scannerHealth.free_heap} B`)}
+    ${kv("Largest heap block", scannerHealth.largest_free_block === undefined ? "-" : `${scannerHealth.largest_free_block} B`)}
+    ${kv("GATT queue", scannerHealth.gatt_queue_depth ?? "-")}
+    ${kv("GATT attempts / failures", scannerHealth.gatt_attempt_count === undefined ? "-" : `${scannerHealth.gatt_attempt_count} / ${scannerHealth.gatt_failure_count || 0}`)}
+    ${kv("GATT timeouts", scannerHealth.gatt_timeout_count ?? "-")}
+    ${kv("Transport last request", scannerHealth.transport_last_path || "-")}
+    ${kv("Transport status / duration", scannerHealth.transport_last_status === undefined ? "-" : `${scannerHealth.transport_last_status || "timeout"} / ${scannerHealth.transport_last_duration_ms || 0} ms`)}
+    ${kv("Transport timeouts", scannerHealth.transport_timeout_count ?? "-")}
+    ${kv("Backlog drain frames", scannerHealth.transport_backlog_drain_count ?? "-")}
+    ${kv("Serial control overflows", scannerHealth.serial_control_overflow_count ?? "-")}
+    ${kv("JSON frame overflows", scannerHealth.upload_json_overflow_count ?? "-")}
+    ${kv("Oversized observations dropped", scannerHealth.upload_oversized_observation_drop_count ?? "-")}
     ${kv("Scanner position source", scannerPosition?.source || "not reported")}
     ${kv("Scanner position fix", scannerPosition?.observed_at ? formatDate(scannerPosition.observed_at) : "-")}
     ${kv("Scanner position age", scannerPosition?.age_seconds === null || scannerPosition?.age_seconds === undefined ? "-" : `${formatNumber(scannerPosition.age_seconds, 1)} s`)}
@@ -2124,7 +2246,7 @@ function connectLive() {
   state.live = source;
   source.addEventListener("connected", () => setLiveState("Connected", "good"));
   source.addEventListener("ping", () => setLiveState("Connected", "good"));
-  ["scanner_heartbeat", "scanner_position_updated", "observations_ingested", "scanner_updated", "device_correlation_changed", "device_tracking_changed", "runtime_state_changed"].forEach((type) => {
+  ["scanner_heartbeat", "scanner_position_updated", "observations_ingested", "device_enrichment_recorded", "scanner_updated", "device_correlation_changed", "device_tracking_changed", "runtime_state_changed"].forEach((type) => {
     source.addEventListener(type, scheduleLiveRefresh);
   });
   source.onerror = () => {

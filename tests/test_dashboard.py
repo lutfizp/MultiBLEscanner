@@ -39,6 +39,20 @@ def test_dashboard_exposes_location_pipeline_diagnostics():
     assert 'api("/api/browser/location-diagnostic"' in source
 
 
+def test_dashboard_exposes_firmware_radio_and_transport_telemetry():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'kv("Firmware", latestHeartbeat.firmware_version' in source
+    assert 'kv("Reset reason", scannerHealth.reset_reason' in source
+    assert 'kv("Radio", scannerHealth.radio_state' in source
+    assert 'kv("Scan callbacks", scannerHealth.scan_callback_count' in source
+    assert 'kv("Last advertisement age"' in source
+    assert 'kv("Largest heap block"' in source
+    assert 'kv("Transport status / duration"' in source
+    assert 'kv("Backlog drain frames"' in source
+    assert 'kv("JSON frame overflows"' in source
+
+
 def test_geolocation_timestamp_falls_back_when_browser_epoch_is_invalid():
     source = APP_JS.read_text(encoding="utf-8")
     start = source.index("function normalizedGeolocationTimestamp")
@@ -98,3 +112,54 @@ def test_map_fit_is_explicit_and_manual_navigation_cancels_pending_fit():
     assert 'state.map.on("dragstart", preserveOperatorViewport)' in source
     assert '$("#fitMapBtn").addEventListener("click", requestMapFit)' in source
     assert "state.selectedMapScannerId = event.target.value;\n    requestMapFit();" in source
+
+
+def test_tracking_stream_rehydrates_history_after_every_sse_connection():
+    source = APP_JS.read_text(encoding="utf-8")
+    connect_start = source.index("function connectTrackingEvents")
+    connect_end = source.index("\nasync function renewTrackingLease", connect_start)
+    implementation = source[connect_start:connect_end]
+
+    assert "async function rehydrateTrackingSession" in source
+    assert 'source.addEventListener("connected"' in implementation
+    assert "rehydrateTrackingSession(sessionId);" in implementation
+    assert "new Map(" in source[source.index("async function rehydrateTrackingSession"):connect_start]
+    assert "sample.sample_id" in source[source.index("async function rehydrateTrackingSession"):connect_start]
+    assert "position.position_id" in source[source.index("async function rehydrateTrackingSession"):connect_start]
+
+
+def test_tracking_freshness_and_trend_use_capture_time_windows():
+    source = APP_JS.read_text(encoding="utf-8")
+    trend_start = source.index("function trackingTrend")
+    trend_end = source.index("\nfunction prepareFinderAudio", trend_start)
+    trend = source[trend_start:trend_end]
+    sample_start = source.index("function handleTrackingSample")
+    sample_end = source.index("\nfunction handleTrackingSessionState", sample_start)
+    sample_handler = source[sample_start:sample_end]
+
+    assert "trend_current_seconds || 4" in trend
+    assert "trend_previous_seconds || 12" in trend
+    assert "new Date(sample.observed_at).getTime()" in trend
+    assert "new Date(sample.observed_at).getTime()" in sample_handler
+    assert "tracking.lastReceivedAt = Date.now()" not in sample_handler
+    assert "sample_stale_seconds || 12" in source
+    assert "sample_stale_seconds || 6" not in source
+
+
+def test_signal_finder_audio_uses_loud_df_style_loop_and_stale_mute():
+    source = APP_JS.read_text(encoding="utf-8")
+    audio_start = source.index("function createFinderToneBuffer")
+    audio_end = source.index("\nfunction stopTrackingRuntime", audio_start)
+    implementation = source[audio_start:audio_end]
+
+    assert "const FINDER_TONE_FREQUENCY_HZ = 440" in source
+    assert "const FINDER_TONE_DURATION_SECONDS = 0.4" in source
+    assert "const FINDER_TONE_ATTACK_SECONDS = 0.02" in source
+    assert "const FINDER_TONE_RELEASE_SECONDS = 0.04" in source
+    assert "const FINDER_TONE_MAX_GAIN = 0.42" in source
+    assert "const FINDER_TONE_GAIN_EXPONENT = 1.35" in source
+    assert "context.createBufferSource()" in implementation
+    assert "source.loop = true" in implementation
+    assert "context.createOscillator()" not in implementation
+    assert "tracking.soundEnabled && !stale" in implementation
+    assert "FINDER_TONE_MAX_GAIN * audibleLevel ** FINDER_TONE_GAIN_EXPONENT" in implementation

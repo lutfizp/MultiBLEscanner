@@ -76,6 +76,15 @@ def ensure_environment_file(project_root: Path = PROJECT_ROOT) -> dict[str, str]
         ]
         values["ESP32_BRIDGE_TIMEOUT"] = "8"
 
+    if values.get("ESP32_SERIAL_BAUD") == "460800":
+        existing_lines = [
+            "ESP32_SERIAL_BAUD=230400"
+            if line.startswith("ESP32_SERIAL_BAUD=")
+            else line
+            for line in existing_lines
+        ]
+        values["ESP32_SERIAL_BAUD"] = "230400"
+
     default_data_dir = "." if (project_root / "bluetooth_scanner.sqlite3").exists() else "data"
     defaults = {
         "APP_NAME": "Bluetooth Scanner",
@@ -106,7 +115,7 @@ def ensure_environment_file(project_root: Path = PROJECT_ROOT) -> dict[str, str]
         "RUN_TLS_CA_FILE": ".local/tls/local-ca.pem",
         "ESP32_SERIAL_ENABLED": "true",
         "ESP32_SERIAL_PORT": "auto",
-        "ESP32_SERIAL_BAUD": "115200",
+        "ESP32_SERIAL_BAUD": "230400",
         "ESP32_SERIAL_START_DELAY": "2.5",
         "ESP32_SERIAL_RETRY_SECONDS": "2",
         "ESP32_BRIDGE_TIMEOUT": "8",

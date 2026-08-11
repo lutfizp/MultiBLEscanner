@@ -35,6 +35,7 @@ class HeartbeatIn(BaseModel):
     uptime_seconds: Optional[int] = Field(default=None, ge=0)
     firmware_version: Optional[str] = Field(default=None, max_length=80)
     hardware_version: Optional[str] = Field(default=None, max_length=80)
+    reset_reason: Optional[str] = Field(default=None, max_length=120)
     network_state: dict[str, Any] = Field(default_factory=dict)
     health: dict[str, Any] = Field(default_factory=dict)
     buffer_usage: int = Field(default=0, ge=0)
@@ -104,6 +105,22 @@ class GATTEnrichmentIn(BaseModel):
                 raise ValueError("Invalid GATT characteristic hex value")
             normalized[key] = normalize_hex(cleaned)
         return normalized
+
+
+class GATTEnrichmentReportIn(BaseModel):
+    report_id: str = Field(min_length=3, max_length=160)
+    source_observation_id: str = Field(min_length=3, max_length=120)
+    enriched_at: Optional[datetime] = None
+    address: str = Field(min_length=11, max_length=80)
+    address_type: str = Field(min_length=3, max_length=80)
+    gatt_enrichment: GATTEnrichmentIn
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("enriched_at", mode="before")
+    @classmethod
+    def empty_datetime_is_none(cls, value: Any) -> Any:
+        return empty_datetime_to_none(value)
 
 
 class BLEObservationIn(BaseModel):

@@ -20,6 +20,7 @@ from .models import Scanner
 from .realtime import broker, tracking_broker
 from .schemas import (
     BrowserLocationDiagnosticIn,
+    GATTEnrichmentReportIn,
     HeartbeatIn,
     ManualCorrelationIn,
     ObservationBatchIn,
@@ -47,6 +48,7 @@ from .services import (
     patch_scanner,
     patch_settings,
     process_batch,
+    record_gatt_enrichment,
     record_heartbeat,
     record_scanner_position,
     refresh_presence_states,
@@ -107,12 +109,6 @@ def require_scanner(
 import logging
 
 logger = logging.getLogger("scanner_status")
-logger.setLevel(logging.INFO)
-# (ensure basic config is set if not already by uvicorn)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter('%(levelname)s:     %(message)s'))
-    logger.addHandler(ch)
 
 def refresh_runtime_state_once(*, run_tracking_cleanup: bool = False) -> dict[str, object]:
     with SessionLocal() as db:
@@ -267,7 +263,31 @@ def observations_batch(
             "session_state",
             change,
         )
-    logger.info("Received batch of %d observations from scanner %s.", len(payload.observations), scanner.id)
+    logger.debug("Received batch of %d observations from scanner %s.", len(payload.observations), scanner.id)
+    return result
+
+
+@app.post("/api/scanners/{scanner_id}/enrichments")
+def scanner_gatt_enrichment(
+    payload: GATTEnrichmentReportIn,
+    background_tasks: BackgroundTasks,
+    scanner: Scanner = Depends(require_scanner),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        result = record_gatt_enrichment(db, scanner, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="source observation has not been stored yet",
+        )
+    background_tasks.add_task(
+        broker.publish,
+        "device_enrichment_recorded",
+        {"scanner_id": scanner.id, **result},
+    )
     return result
 
 

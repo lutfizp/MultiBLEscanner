@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.bluetooth_sig import (
@@ -32,6 +32,7 @@ from backend.app.schemas import (
     BLEObservationIn,
     BrowserLocationDiagnosticIn,
     GATTEnrichmentIn,
+    GATTEnrichmentReportIn,
     HeartbeatIn,
     ObservationBatchIn,
     ScannerPositionIn,
@@ -73,6 +74,23 @@ def test_sqlite_engine_uses_bounded_wal_friendly_pool_options():
     assert options["max_overflow"] == 0
     assert options["pool_timeout"] == SQLITE_BUSY_TIMEOUT_SECONDS
     assert options["connect_args"]["timeout"] == SQLITE_BUSY_TIMEOUT_SECONDS
+
+
+def test_observation_idempotency_lookup_uses_composite_index():
+    test_engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(test_engine)
+
+    with test_engine.connect() as connection:
+        plan = connection.execute(
+            text(
+                "EXPLAIN QUERY PLAN SELECT id FROM observations "
+                "WHERE scanner_id = :scanner_id AND observation_id = :observation_id"
+            ),
+            {"scanner_id": "scn-index", "observation_id": "obs-index"},
+        ).all()
+
+    details = " ".join(str(row[-1]) for row in plan)
+    assert "ix_observations_scanner_observation" in details
 
 
 def test_journal_distance_model_is_explicit_and_bounded_by_provenance():
@@ -650,6 +668,71 @@ def test_gatt_enrichment_is_directly_stored_and_preferred_for_display_name():
         assert detail["recent_observations"][0]["gatt_enrichment"]["status"] == "success"
 
 
+def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_independent():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import DeviceEnrichment, Observation, Scanner, ScannerConfiguration
+    from backend.app.services import process_batch, record_gatt_enrichment
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn_gatt_separate",
+            display_name="Separate GATT Scanner",
+            hardware_id="gatt-separate-001",
+            token_hash="hash",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+        process_batch(
+            db,
+            scanner,
+            ObservationBatchIn(
+                batch_id="batch-gatt-separate",
+                observations=[
+                    {
+                        "observation_id": "obs-gatt-separate",
+                        "address": "24:11:11:b3:eb:ee",
+                        "address_type": "public",
+                        "advertised_name": "broadcast-name",
+                        "rssi": -60,
+                        "connectable": True,
+                    }
+                ],
+            ),
+        )
+        report = GATTEnrichmentReportIn(
+            report_id="gatt-obs-gatt-separate",
+            source_observation_id="obs-gatt-separate",
+            enriched_at=utcnow(),
+            address="24:11:11:b3:eb:ee",
+            address_type="public",
+            gatt_enrichment={
+                "status": "success",
+                "device_name": "Space Travel",
+                "model_number": "TWS-01",
+                "discovered_services": ["1800", "180a"],
+                "attempt_duration_ms": 412,
+            },
+        )
+
+        first = record_gatt_enrichment(db, scanner, report)
+        duplicate = record_gatt_enrichment(db, scanner, report)
+        observation = db.execute(select(Observation)).scalar_one()
+        enrichment = db.execute(select(DeviceEnrichment)).scalar_one()
+
+        assert first["accepted"] is True
+        assert duplicate["duplicate"] is True
+        assert enrichment.source_observation_id == observation.observation_id
+        assert enrichment.details["reported_separately"] is True
+        assert observation.processing_notes["gatt_enrichment"] is None
+        assert observation.logical_device.display_name == "Space Travel"
+
+
 @pytest.mark.parametrize("status", ["operation_timeout", "cancelled"])
 def test_gatt_terminal_worker_statuses_are_valid_direct_evidence(status):
     enrichment = GATTEnrichmentIn(
@@ -1017,7 +1100,7 @@ def test_heartbeat_updates_scanner_hardware_provenance():
     TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
     from backend.app.models import Scanner
-    from backend.app.services import record_heartbeat
+    from backend.app.services import diagnostics, record_heartbeat
 
     with TestSession() as db:
         scanner = Scanner(
@@ -1038,6 +1121,12 @@ def test_heartbeat_updates_scanner_hardware_provenance():
                 message_id="hb-hardware-1",
                 firmware_version="esp32-ble-scanner-1.4.1",
                 hardware_version="esp32-d0wd-v3",
+                reset_reason="brownout",
+                health={
+                    "radio_state": "scanning",
+                    "scan_callback_count": 42,
+                    "largest_free_block": 32000,
+                },
             ),
         )
         db.refresh(scanner)
@@ -1045,6 +1134,11 @@ def test_heartbeat_updates_scanner_hardware_provenance():
         assert result == {"accepted": True, "duplicate": False}
         assert scanner.firmware_version == "esp32-ble-scanner-1.4.1"
         assert scanner.hardware_version == "esp32-d0wd-v3"
+        assert scanner.reset_reason == "brownout"
+        latest = diagnostics(db)["latest_heartbeat"]
+        assert latest["firmware_version"] == "esp32-ble-scanner-1.4.1"
+        assert latest["health"]["radio_state"] == "scanning"
+        assert latest["health"]["scan_callback_count"] == 42
 
 
 def test_usb_observation_reuses_scanner_time_when_observed_at_is_missing():

@@ -56,7 +56,7 @@ Request:
 {
   "hardware_id": "usb-esp32-002",
   "display_name": "Bekasi Scanner",
-  "firmware_version": "esp32-ble-scanner-1.5.0",
+  "firmware_version": "esp32-ble-scanner-1.6.8",
   "hardware_version": "esp32-d0wd-v3",
   "installation_name": "bekasi-gateway"
 }
@@ -98,8 +98,9 @@ Records one immutable health sample and updates current scanner state. `message_
   "message_id": "hb-boot-id-104",
   "scanner_time": "2026-07-15T08:10:00.000Z",
   "uptime_seconds": 683,
-  "firmware_version": "esp32-ble-scanner-1.5.0",
+  "firmware_version": "esp32-ble-scanner-1.6.8",
   "hardware_version": "esp32-d0wd-v3",
+  "reset_reason": "power_on",
   "network_state": {"transport": "usb_serial", "connected": true},
   "health": {
     "free_heap": 132448,
@@ -115,7 +116,8 @@ Records one immutable health sample and updates current scanner state. `message_
     "transport_last_status": 200,
     "transport_last_duration_ms": 41,
     "transport_timeout_count": 0,
-    "transport_failure_count": 0
+    "transport_failure_count": 0,
+    "serial_control_overflow_count": 0
   },
   "buffer_usage": 8,
   "pending_observations": 8,
@@ -226,7 +228,27 @@ The service returns accepted, duplicate, ignored, and failed item counts plus it
 
 ## GATT Enrichment
 
-`gatt_enrichment` is optional and is stored separately from advertisement inference. Its `status` is one of:
+Legacy observation payloads may include optional `gatt_enrichment`. Firmware `1.6.8` sends raw observations immediately and reports GATT separately through `POST /api/scanners/{scanner_id}/enrichments`:
+
+```json
+{
+  "report_id": "gatt-obs-scn-101",
+  "source_observation_id": "obs-scn-101",
+  "enriched_at": "2026-08-10T03:24:20.100Z",
+  "address": "24:11:11:b3:eb:ee",
+  "address_type": "public",
+  "gatt_enrichment": {
+    "status": "success",
+    "device_name": "Space Travel",
+    "model_number": "TWS-01",
+    "discovered_services": ["1800", "180a"],
+    "characteristic_values": {"2a24": "5457532d3031"},
+    "attempt_duration_ms": 412
+  }
+}
+```
+
+The source observation must already exist for the same authenticated scanner. A missing source returns HTTP 409 so firmware can retry; an address mismatch returns HTTP 400; an existing source/transport pair returns an idempotent duplicate response. The enrichment `status` is one of:
 
 - `success`
 - `partial`
@@ -236,7 +258,7 @@ The service returns accepted, duplicate, ignored, and failed item counts plus it
 - `operation_timeout`
 - `cancelled`
 
-`operation_timeout` means the scanner released the source observation after its GATT pipeline deadline. `cancelled` means an explicit scanner mode change, currently focused tracking, stopped the attempt. `security_required` records a protected characteristic without forcing pairing.
+`operation_timeout` means the peripheral did not complete within the six-second GATT operation budget. `cancelled` means an explicit scanner mode change, currently focused tracking, stopped the attempt. `security_required` records a protected characteristic without forcing pairing.
 
 Direct fields include device name, manufacturer, model, serial, firmware/hardware/software revisions, System ID, PnP ID, discovered services, and raw characteristic values. Binary values are lowercase hexadecimal after validation. At most 64 characteristic values, 512 bytes per value, and 128 discovered services are accepted. Absence does not imply an empty or unknown value was read.
 
@@ -261,8 +283,8 @@ The response contains:
 - session ID, logical device ID, mode, state, start/lease/expiry/end timestamps, stop reason, and summary;
 - scanner assignments, accepted target identities, fixed coordinate snapshot, sample freshness, smoothed RSSI, and dropped-sample count;
 - a 30-second `lease_seconds` value;
-- the six-second `sample_stale_seconds` value;
-- the backend signal scale and EMA coefficient.
+- the adaptive `sample_stale_seconds` value for each assignment and the session, bounded to 12-30 seconds;
+- the backend signal scale, four-second median window, and four-versus-twelve-second trend windows.
 
 Active state values are `arming`, `waiting_for_advertisement`, `live`, `stale`, `scanner_offline`, and `identity_changed`. Terminal states are `stopped` and `expired`.
 

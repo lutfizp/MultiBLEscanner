@@ -61,6 +61,7 @@ from .processing import (
 )
 from .schemas import (
     BLEObservationIn,
+    GATTEnrichmentReportIn,
     HeartbeatIn,
     ManualCorrelationIn,
     ObservationBatchIn,
@@ -374,6 +375,8 @@ def record_heartbeat(db: Session, scanner: Scanner, payload: HeartbeatIn) -> dic
     scanner.firmware_version = payload.firmware_version or scanner.firmware_version
     scanner.hardware_version = payload.hardware_version or scanner.hardware_version
     scanner.network_info = payload.network_state
+    if payload.reset_reason:
+        scanner.reset_reason = payload.reset_reason
     if payload.config_version is not None:
         scanner.config_version = payload.config_version
 
@@ -392,6 +395,93 @@ def record_heartbeat(db: Session, scanner: Scanner, payload: HeartbeatIn) -> dic
 
     db.commit()
     return {"accepted": True, "duplicate": False}
+
+
+def record_gatt_enrichment(
+    db: Session,
+    scanner: Scanner,
+    payload: GATTEnrichmentReportIn,
+) -> dict[str, Any] | None:
+    existing = db.execute(
+        select(DeviceEnrichment).where(
+            DeviceEnrichment.scanner_id == scanner.id,
+            DeviceEnrichment.source_observation_id == payload.source_observation_id,
+            DeviceEnrichment.transport == "ble_gatt",
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return {
+            "accepted": False,
+            "duplicate": True,
+            "enrichment_id": existing.id,
+            "logical_device_id": existing.logical_device_id,
+        }
+
+    source = db.execute(
+        select(Observation).where(
+            Observation.scanner_id == scanner.id,
+            Observation.observation_id == payload.source_observation_id,
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        return None
+    identity = db.get(ObservedIdentity, source.observed_identity_id)
+    logical = db.get(LogicalDevice, source.logical_device_id)
+    if identity is None or logical is None:
+        raise ValueError("source observation identity is unavailable")
+    if normalize_address(payload.address) != normalize_address(identity.address or ""):
+        raise ValueError("enrichment address does not match source observation")
+    if payload.address_type.strip().lower() != (identity.address_type or "").strip().lower():
+        raise ValueError("enrichment address type does not match source observation")
+
+    now = utcnow()
+    enriched_at = ensure_utc(payload.enriched_at, now) if payload.enriched_at else now
+    if enriched_at > now + timedelta(minutes=5):
+        enriched_at = now
+    enrichment = payload.gatt_enrichment
+    gatt_name = enrichment.device_name.strip() if enrichment.device_name else None
+    record = DeviceEnrichment(
+        logical_device_id=logical.id,
+        observed_identity_id=identity.id,
+        scanner_id=scanner.id,
+        source_observation_id=payload.source_observation_id,
+        enriched_at=enriched_at,
+        transport="ble_gatt",
+        status=enrichment.status,
+        device_name=gatt_name,
+        manufacturer_name=enrichment.manufacturer_name,
+        model_number=enrichment.model_number,
+        serial_number=enrichment.serial_number,
+        firmware_revision=enrichment.firmware_revision,
+        hardware_revision=enrichment.hardware_revision,
+        software_revision=enrichment.software_revision,
+        system_id=enrichment.system_id,
+        pnp_id=enrichment.pnp_id,
+        discovered_services=enrichment.discovered_services,
+        characteristic_values=enrichment.characteristic_values,
+        error_code=enrichment.error_code,
+        attempt_duration_ms=enrichment.attempt_duration_ms,
+        details={
+            "directly_read": True,
+            "pairing_forced": False,
+            "address": identity.address,
+            "address_type": identity.address_type,
+            "report_id": payload.report_id,
+            "reported_separately": True,
+        },
+    )
+    db.add(record)
+    if gatt_name:
+        logical.display_name = gatt_name
+        logical.category = logical.category or infer_device_category(gatt_name, [], None)
+    db.commit()
+    db.refresh(record)
+    return {
+        "accepted": True,
+        "duplicate": False,
+        "enrichment_id": record.id,
+        "logical_device_id": logical.id,
+    }
 
 
 def create_event(
@@ -2009,6 +2099,7 @@ def serialize_scanner(scanner: Scanner) -> dict[str, Any]:
         "last_heartbeat_at": serialize_datetime(scanner.last_heartbeat_at),
         "last_seen_at": serialize_datetime(scanner.last_seen_at),
         "uptime_seconds": scanner.uptime_seconds,
+        "reset_reason": scanner.reset_reason,
         "config_version": scanner.config_version,
         "network_info": scanner.network_info,
         "maintenance_notes": scanner.maintenance_notes,
@@ -2729,6 +2820,9 @@ def diagnostics(db: Session) -> dict[str, Any]:
             "buffer_usage": latest_heartbeat.buffer_usage,
             "pending_observations": latest_heartbeat.pending_observations,
             "dropped_observations": latest_heartbeat.dropped_observations,
+            "firmware_version": latest_heartbeat.firmware_version,
+            "uptime_seconds": latest_heartbeat.uptime_seconds,
+            "health": latest_heartbeat.health or {},
         }
         if latest_heartbeat
         else None,

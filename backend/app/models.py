@@ -229,6 +229,7 @@ class Observation(Base):
     __table_args__ = (
         UniqueConstraint("scanner_id", "batch_id", "observation_id", name="uq_observation_scanner_batch_item"),
         Index("ix_observations_received", "server_received_at"),
+        Index("ix_observations_scanner_observation", "scanner_id", "observation_id"),
         Index("ix_observations_device_identity", "logical_device_id", "observed_identity_id"),
         Index("ix_observations_scanner_time", "scanner_id", "observed_at"),
         Index("ix_observations_device_time", "logical_device_id", "observed_at"),

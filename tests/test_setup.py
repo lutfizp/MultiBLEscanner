@@ -76,6 +76,21 @@ def test_environment_setup_replaces_only_the_legacy_bridge_timeout(tmp_path: Pat
     assert "ESP32_BRIDGE_TIMEOUT=8" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
+def test_environment_setup_replaces_previous_managed_serial_baud(tmp_path: Path):
+    from setup_project import ensure_environment_file
+
+    (tmp_path / ".env").write_text(
+        "LOCAL_SCANNER_TOKEN=retained-token\nESP32_SERIAL_BAUD=460800\n",
+        encoding="utf-8",
+    )
+
+    values = ensure_environment_file(tmp_path)
+
+    assert values["LOCAL_SCANNER_TOKEN"] == "retained-token"
+    assert values["ESP32_SERIAL_BAUD"] == "230400"
+    assert "ESP32_SERIAL_BAUD=230400" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
 def test_local_tls_certificate_covers_loopback_hosts(tmp_path: Path):
     from setup_project import ensure_local_tls
 
@@ -118,7 +133,7 @@ def test_firmware_config_refreshes_managed_release_constants(tmp_path: Path):
         "\n".join(
             [
                 '#define SCANNER_ID "scn_replace_me"',
-                '#define FIRMWARE_VERSION "esp32-ble-scanner-1.5.0"',
+                '#define FIRMWARE_VERSION "esp32-ble-scanner-1.6.9"',
                 "#define SERIAL_BRIDGE_RESPONSE_TIMEOUT_MS 12000",
                 "",
             ],
@@ -141,7 +156,7 @@ def test_firmware_config_refreshes_managed_release_constants(tmp_path: Path):
     content = config_path.read_text(encoding="utf-8")
 
     assert '#define SCANNER_ID "scn_engineering_001"' in content
-    assert '#define FIRMWARE_VERSION "esp32-ble-scanner-1.5.0"' in content
+    assert '#define FIRMWARE_VERSION "esp32-ble-scanner-1.6.9"' in content
     assert "#define SERIAL_BRIDGE_RESPONSE_TIMEOUT_MS 12000" in content
     assert "60000" not in content
 

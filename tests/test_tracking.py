@@ -10,6 +10,7 @@ from backend.app.database import Base
 from backend.app.models import (
     DeviceTrackingPosition,
     DeviceTrackingSample,
+    DeviceTrackingScanner,
     DeviceTrackingSession,
     LogicalDevice,
     Observation,
@@ -320,7 +321,7 @@ def test_late_sample_is_stored_but_not_emitted_as_live():
         scanner, device, _identity = seed_tracking_device(db)
         session = start_tracking_session(db, device.id, TrackingSessionCreateIn(mode="fixed"))
         payload = focus_batch(session["id"])
-        payload.samples[0].observed_at = utcnow() - timedelta(seconds=10)
+        payload.samples[0].observed_at = utcnow() - timedelta(seconds=20)
 
         result = ingest_tracking_samples(db, scanner, payload)
         stored = db.execute(select(DeviceTrackingSample)).scalar_one()
@@ -328,15 +329,18 @@ def test_late_sample_is_stored_but_not_emitted_as_live():
         assert result["accepted"] == 1
         assert result["live_samples"] == []
         assert stored.delayed is True
+        assignment = db.execute(select(DeviceTrackingScanner)).scalar_one()
+        assert assignment.last_sample_at is None
+        assert assignment.state == "arming"
 
 
-def test_usb_transport_latency_within_six_seconds_remains_live():
+def test_usb_transport_latency_within_minimum_adaptive_window_remains_live():
     Session = tracking_sessionmaker()
     with Session() as db:
         scanner, device, _identity = seed_tracking_device(db)
         session = start_tracking_session(db, device.id, TrackingSessionCreateIn(mode="fixed"))
         payload = focus_batch(session["id"])
-        payload.samples[0].observed_at = utcnow() - timedelta(seconds=4)
+        payload.samples[0].observed_at = utcnow() - timedelta(seconds=8)
 
         result = ingest_tracking_samples(db, scanner, payload)
         stored = db.execute(select(DeviceTrackingSample)).scalar_one()
@@ -344,3 +348,60 @@ def test_usb_transport_latency_within_six_seconds_remains_live():
         assert result["accepted"] == 1
         assert len(result["live_samples"]) == 1
         assert stored.delayed is False
+
+
+def test_tracking_uses_four_second_time_window_median():
+    Session = tracking_sessionmaker()
+    with Session() as db:
+        scanner, device, _identity = seed_tracking_device(db)
+        session = start_tracking_session(db, device.id, TrackingSessionCreateIn(mode="fixed"))
+
+        for sequence, rssi in enumerate([-90, -60, -61], start=1):
+            payload = focus_batch(session["id"], sequence=sequence)
+            payload.samples[0].rssi = rssi
+            ingest_tracking_samples(db, scanner, payload)
+
+        samples = db.execute(
+            select(DeviceTrackingSample).order_by(DeviceTrackingSample.sequence)
+        ).scalars().all()
+
+        assert [sample.smoothed_rssi for sample in samples] == [-90.0, -75.0, -61.0]
+
+
+def test_tracking_stale_window_adapts_to_observed_advertising_cadence():
+    Session = tracking_sessionmaker()
+    with Session() as db:
+        scanner, device, identity = seed_tracking_device(db)
+        session = start_tracking_session(db, device.id, TrackingSessionCreateIn(mode="fixed"))
+        assignment = db.execute(select(DeviceTrackingScanner)).scalar_one()
+        started_at = utcnow() - timedelta(seconds=50)
+        for sequence in range(6):
+            observed_at = started_at + timedelta(seconds=sequence * 8)
+            db.add(
+                DeviceTrackingSample(
+                    session_id=session["id"],
+                    assignment_id=assignment.id,
+                    scanner_id=scanner.id,
+                    observed_identity_id=identity.id,
+                    batch_id=f"adaptive-batch-{sequence}",
+                    sample_id=f"adaptive-sample-{sequence}",
+                    observed_at=observed_at,
+                    server_received_at=observed_at + timedelta(seconds=2),
+                    boot_id="boot-adaptive",
+                    monotonic_ms=sequence * 8000,
+                    sequence=sequence,
+                    address=identity.address,
+                    address_type=identity.address_type,
+                    rssi=-65,
+                    smoothed_rssi=-65.0,
+                    signal_level=0.5,
+                    delayed=False,
+                )
+            )
+        db.commit()
+
+        hydrated = get_tracking_session(db, session["id"])
+
+        assert hydrated["sample_stale_seconds"] == 16
+        assert hydrated["assignments"][0]["sample_stale_seconds"] == 16
+        assert hydrated["signal_scale"]["filter"] == "time_window_median"

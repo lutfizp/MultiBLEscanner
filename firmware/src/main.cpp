@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
+#include <esp_system.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
@@ -59,11 +60,13 @@ struct EnrichmentTarget {
   uint8_t addressType = 0;
   int rssi = -127;
   bool hasAdvertisedName = false;
+  String sourceObservationId;
 };
 
 struct EnrichmentCacheEntry {
   String address;
   uint8_t addressType = 0;
+  uint32_t attemptedAt = 0;
 };
 
 struct TrackingTarget {
@@ -80,6 +83,11 @@ struct TrackingConfig {
   uint32_t uploadIntervalMs = TRACKING_UPLOAD_INTERVAL_MS;
   size_t targetCount = 0;
   TrackingTarget targets[TRACKING_TARGET_LIMIT];
+};
+
+struct TrackingSchedule {
+  bool active = false;
+  uint32_t uploadIntervalMs = TRACKING_UPLOAD_INTERVAL_MS;
 };
 
 struct TrackingSample {
@@ -105,6 +113,8 @@ struct GattWorkerContext {
   uint32_t startedAt = 0;
   bool done = false;
   bool abandoned = false;
+  String terminalStatus;
+  String terminalErrorCode;
 };
 
 struct DirectGattReadContext {
@@ -116,19 +126,42 @@ struct DirectGattReadContext {
   bool truncated = false;
 };
 
+struct PendingGattEnrichment {
+  bool ready = false;
+  uint32_t queuedAt = 0;
+  uint32_t retryCount = 0;
+  String sourceObservationId;
+  String enrichedAt;
+  String address;
+  String addressType;
+  Observation result;
+};
+
 class ScanCallbacks;
 
 ScannerConfig scannerConfig;
 TrackingConfig trackingConfig;
 Observation observationBuffer[OBSERVATION_BUFFER_SIZE];
 Observation pendingObservationBuffer[MAX_SERIAL_FRAME_OBSERVATIONS];
+constexpr size_t OBSERVATION_UPLOAD_JSON_CAPACITY = UPLOAD_JSON_BASE_CAPACITY
+  + MAX_SERIAL_FRAME_OBSERVATIONS * UPLOAD_JSON_PER_OBSERVATION_CAPACITY;
 size_t bufferHead = 0;
 size_t bufferTail = 0;
 size_t bufferCount = 0;
 uint32_t droppedObservations = 0;
+size_t observationBufferHighWatermark = 0;
 uint32_t observationCounter = 0;
 uint32_t lastScanAt = 0;
 uint32_t scanCycle = 0;
+uint32_t scanStartCount = 0;
+uint32_t scanRestartCount = 0;
+uint32_t scanWindowCount = 0;
+uint32_t scanEmptyWindowCount = 0;
+uint32_t scanCallbackCount = 0;
+uint32_t scanAcceptedObservationCount = 0;
+uint32_t lastAdvertisementAt = 0;
+uint32_t lastScanStartedAt = 0;
+uint32_t lastScanWindowCallbackCount = 0;
 uint32_t batchSequence = 0;
 uint32_t lastClockSyncAt = 0;
 int64_t clockOffsetMs = 0;
@@ -149,6 +182,14 @@ size_t enrichmentQueueCount = 0;
 EnrichmentCacheEntry enrichmentCache[GATT_ENRICHMENT_CACHE_SIZE];
 size_t enrichmentCacheCount = 0;
 size_t enrichmentCacheCursor = 0;
+uint32_t lastGattAttemptAt = 0;
+uint32_t gattAdmissionRejectedCount = 0;
+uint32_t gattAttemptCount = 0;
+uint32_t gattSuccessCount = 0;
+uint32_t gattFailureCount = 0;
+uint32_t gattTimeoutCount = 0;
+uint32_t gattResultDroppedCount = 0;
+PendingGattEnrichment pendingGattEnrichment;
 TrackingSample trackingSampleBuffer[TRACKING_SAMPLE_BUFFER_SIZE];
 size_t trackingBufferHead = 0;
 size_t trackingBufferTail = 0;
@@ -157,7 +198,6 @@ uint32_t droppedTrackingSamples = 0;
 uint32_t pendingDroppedTrackingSamples = 0;
 uint32_t trackingSequence = 0;
 uint32_t lastTrackingUploadAt = 0;
-uint32_t lastTrackingCycleAt = 0;
 uint32_t lastTrackingSampleAt[TRACKING_TARGET_LIMIT] = {0};
 TrackingSample pendingTrackingSampleBuffer[MAX_TRACKING_SERIAL_FRAME_SAMPLES];
 String pendingTrackingBatchId;
@@ -172,17 +212,25 @@ ScanCallbacks *scanCallbacks = nullptr;
 SemaphoreHandle_t observationBufferMutex = nullptr;
 SemaphoreHandle_t trackingConfigMutex = nullptr;
 SemaphoreHandle_t serialControlMutex = nullptr;
+SemaphoreHandle_t enrichmentQueueMutex = nullptr;
+SemaphoreHandle_t gattResultMutex = nullptr;
 TaskHandle_t transportTaskHandle = nullptr;
-volatile bool normalUploadReady = false;
+TaskHandle_t gattWorkerTaskHandle = nullptr;
 uint32_t transportRequestSequence = 0;
 uint32_t transportTimeoutCount = 0;
 uint32_t transportFailureCount = 0;
+uint32_t transportBacklogDrainCount = 0;
+uint32_t serialControlOverflowCount = 0;
+uint32_t uploadJsonOverflowCount = 0;
+uint32_t uploadOversizedObservationDropCount = 0;
 uint32_t transportLastDurationMs = 0;
 int transportLastStatus = 0;
 String transportLastPath;
 portMUX_TYPE trackingBufferMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE idMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE radioTelemetryMux = portMUX_INITIALIZER_UNLOCKED;
 GattWorkerContext *gattWorkerContext = nullptr;
+GattWorkerContext gattWorkerStorage;
 SemaphoreHandle_t gattWorkerMutex = nullptr;
 
 const char *TIME_SYNC_PREFIX = "@@BT_SCANNER_TIME@@";
@@ -309,6 +357,40 @@ const char *timeSource() {
   return clockSynchronized ? "usb_host_synchronized" : "unsynchronized";
 }
 
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power_on";
+    case ESP_RST_EXT:
+      return "external_reset";
+    case ESP_RST_SW:
+      return "software_reset";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT:
+      return "task_watchdog";
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_DEEPSLEEP:
+      return "deep_sleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    default:
+      return "unknown";
+  }
+}
+
+uint32_t currentScanCycle() {
+  portENTER_CRITICAL(&radioTelemetryMux);
+  uint32_t current = scanCycle;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  return current;
+}
+
 uint32_t clockSyncAgeMs() {
   return clockSynchronized ? millis() - lastClockSyncAt : 0;
 }
@@ -363,7 +445,7 @@ void applyConfig(const String &payload) {
   uint16_t batchSize = doc["batch_size"] | scannerConfig.maxBatchSize;
   int rssiMin = doc["rssi_min"] | scannerConfig.rssiMin;
 
-  if (scanIntervalMs >= SCAN_DURATION_SECONDS * 1000UL && scanIntervalMs <= 60000UL) {
+  if (scanIntervalMs >= 1000UL && scanIntervalMs <= 60000UL) {
     scannerConfig.scanIntervalMs = scanIntervalMs;
   }
   if (uploadIntervalSeconds >= 1 && uploadIntervalSeconds <= 60) {
@@ -463,6 +545,7 @@ void pollSerialControl() {
     if (command.length() < SERIAL_CONTROL_MAX_BYTES) {
       command += character;
     } else {
+      serialControlOverflowCount++;
       command = "";
     }
   }
@@ -500,22 +583,24 @@ String makeId(const char *prefix) {
   observationCounter++;
   uint32_t sequence = observationCounter;
   portEXIT_CRITICAL(&idMux);
-  return String(prefix) + "-" + SCANNER_ID + "-" + String(millis()) + "-" + String(sequence);
+  return String(prefix) + "-" + SCANNER_ID + "-" + bootId + "-" + String(millis()) + "-" + String(sequence);
 }
 
-void pushObservation(const Observation &observation) {
+bool pushObservation(const Observation &observation) {
   xSemaphoreTake(observationBufferMutex, portMAX_DELAY);
   if (bufferCount == OBSERVATION_BUFFER_SIZE) {
     // Preserve queued retry order. New RF evidence is counted as dropped when
     // the bounded queue is full instead of invalidating an in-flight batch.
     droppedObservations++;
     xSemaphoreGive(observationBufferMutex);
-    return;
+    return false;
   }
   observationBuffer[bufferHead] = observation;
   bufferHead = (bufferHead + 1) % OBSERVATION_BUFFER_SIZE;
   bufferCount++;
+  observationBufferHighWatermark = max(observationBufferHighWatermark, bufferCount);
   xSemaphoreGive(observationBufferMutex);
+  return true;
 }
 
 void popObservationsLocked(size_t count) {
@@ -552,6 +637,15 @@ TrackingConfig snapshotTrackingConfig(uint32_t *generation = nullptr) {
   if (generation != nullptr) {
     *generation = trackingConfigGeneration;
   }
+  xSemaphoreGive(trackingConfigMutex);
+  return snapshot;
+}
+
+TrackingSchedule snapshotTrackingSchedule() {
+  xSemaphoreTake(trackingConfigMutex, portMAX_DELAY);
+  TrackingSchedule snapshot;
+  snapshot.active = trackingConfig.active;
+  snapshot.uploadIntervalMs = trackingConfig.uploadIntervalMs;
   xSemaphoreGive(trackingConfigMutex);
   return snapshot;
 }
@@ -606,20 +700,18 @@ void captureTrackingSample(const String &address, const String &addressType, int
   xSemaphoreGive(trackingConfigMutex);
 }
 
-bool allowTrackingNormalObservation(
+bool allowNormalObservation(
   const String &address,
   bool hasName,
-  size_t payloadLength
+  size_t payloadLength,
+  uint32_t currentCycle
 ) {
-  if (!trackingIsActive()) {
-    return true;
-  }
   size_t freeIndex = TRACKING_NORMAL_DEVICE_SLOTS;
   for (size_t index = 0; index < TRACKING_NORMAL_DEVICE_SLOTS; index++) {
     TrackingNormalDeviceSlot &slot = trackingNormalSlots[index];
     if (slot.address == address) {
-      if (slot.cycle != scanCycle) {
-        slot.cycle = scanCycle;
+      if (slot.cycle != currentCycle) {
+        slot.cycle = currentCycle;
         slot.bestPayloadLength = payloadLength;
         slot.hasName = hasName;
         return true;
@@ -637,7 +729,7 @@ bool allowTrackingNormalObservation(
     ? freeIndex
     : trackingNormalSlotCursor++ % TRACKING_NORMAL_DEVICE_SLOTS;
   trackingNormalSlots[targetIndex].address = address;
-  trackingNormalSlots[targetIndex].cycle = scanCycle;
+  trackingNormalSlots[targetIndex].cycle = currentCycle;
   trackingNormalSlots[targetIndex].bestPayloadLength = payloadLength;
   trackingNormalSlots[targetIndex].hasName = hasName;
   return true;
@@ -647,19 +739,20 @@ bool sameEnrichmentTarget(const String &address, uint8_t addressType, const Enri
   return entry.address == address && entry.addressType == addressType;
 }
 
-bool enrichmentWasAttempted(const String &address, uint8_t addressType) {
+bool enrichmentWasAttemptedLocked(const String &address, uint8_t addressType, uint32_t now) {
   for (size_t index = 0; index < enrichmentCacheCount; index++) {
     if (sameEnrichmentTarget(address, addressType, enrichmentCache[index])) {
-      return true;
+      return now - enrichmentCache[index].attemptedAt < GATT_ENRICHMENT_COOLDOWN_MS;
     }
   }
   return false;
 }
 
-void rememberEnrichmentAttempt(const String &address, uint8_t addressType) {
+void rememberEnrichmentAttemptLocked(const String &address, uint8_t addressType, uint32_t now) {
   EnrichmentCacheEntry entry;
   entry.address = address;
   entry.addressType = addressType;
+  entry.attemptedAt = now;
   if (enrichmentCacheCount < GATT_ENRICHMENT_CACHE_SIZE) {
     enrichmentCache[enrichmentCacheCount++] = entry;
     return;
@@ -669,17 +762,37 @@ void rememberEnrichmentAttempt(const String &address, uint8_t addressType) {
 }
 
 int enrichmentPriority(const EnrichmentTarget &target) {
-  return target.rssi + (target.hasAdvertisedName ? 0 : 30);
+  return target.rssi + (target.hasAdvertisedName ? 20 : 0);
 }
 
-void queueEnrichmentTarget(const String &address, uint8_t addressType, int rssi, bool hasAdvertisedName) {
-  if (enrichmentWasAttempted(address, addressType)) {
+void queueEnrichmentTarget(
+  const String &address,
+  uint8_t addressType,
+  int rssi,
+  bool hasAdvertisedName,
+  const String &sourceObservationId
+) {
+  if (
+    rssi < GATT_ENRICHMENT_MIN_RSSI_DBM
+    || (!hasAdvertisedName && rssi < GATT_ENRICHMENT_UNNAMED_MIN_RSSI_DBM)
+  ) {
+    portENTER_CRITICAL(&radioTelemetryMux);
+    gattAdmissionRejectedCount++;
+    portEXIT_CRITICAL(&radioTelemetryMux);
+    return;
+  }
+  uint32_t now = millis();
+  xSemaphoreTake(enrichmentQueueMutex, portMAX_DELAY);
+  if (enrichmentWasAttemptedLocked(address, addressType, now)) {
+    xSemaphoreGive(enrichmentQueueMutex);
     return;
   }
   for (size_t index = 0; index < enrichmentQueueCount; index++) {
     if (enrichmentQueue[index].address == address && enrichmentQueue[index].addressType == addressType) {
       enrichmentQueue[index].rssi = max(enrichmentQueue[index].rssi, rssi);
       enrichmentQueue[index].hasAdvertisedName = enrichmentQueue[index].hasAdvertisedName || hasAdvertisedName;
+      enrichmentQueue[index].sourceObservationId = sourceObservationId;
+      xSemaphoreGive(enrichmentQueueMutex);
       return;
     }
   }
@@ -689,8 +802,10 @@ void queueEnrichmentTarget(const String &address, uint8_t addressType, int rssi,
   target.addressType = addressType;
   target.rssi = rssi;
   target.hasAdvertisedName = hasAdvertisedName;
+  target.sourceObservationId = sourceObservationId;
   if (enrichmentQueueCount < GATT_ENRICHMENT_QUEUE_SIZE) {
     enrichmentQueue[enrichmentQueueCount++] = target;
+    xSemaphoreGive(enrichmentQueueMutex);
     return;
   }
 
@@ -703,10 +818,26 @@ void queueEnrichmentTarget(const String &address, uint8_t addressType, int rssi,
   if (enrichmentPriority(target) > enrichmentPriority(enrichmentQueue[weakestIndex])) {
     enrichmentQueue[weakestIndex] = target;
   }
+  xSemaphoreGive(enrichmentQueueMutex);
 }
 
 bool takeNextEnrichmentTarget(EnrichmentTarget &target) {
+  uint32_t now = millis();
+  if (
+    lastGattAttemptAt != 0
+    && now - lastGattAttemptAt < GATT_ENRICHMENT_MIN_INTERVAL_MS
+  ) {
+    return false;
+  }
+  if (
+    ESP.getFreeHeap() < GATT_MIN_FREE_HEAP_BYTES
+    || ESP.getMaxAllocHeap() < GATT_MIN_LARGEST_BLOCK_BYTES
+  ) {
+    return false;
+  }
+  xSemaphoreTake(enrichmentQueueMutex, portMAX_DELAY);
   if (enrichmentQueueCount == 0) {
+    xSemaphoreGive(enrichmentQueueMutex);
     return false;
   }
   size_t strongestIndex = 0;
@@ -718,48 +849,10 @@ bool takeNextEnrichmentTarget(EnrichmentTarget &target) {
   target = enrichmentQueue[strongestIndex];
   enrichmentQueue[strongestIndex] = enrichmentQueue[enrichmentQueueCount - 1];
   enrichmentQueueCount--;
+  rememberEnrichmentAttemptLocked(target.address, target.addressType, now);
+  lastGattAttemptAt = now;
+  xSemaphoreGive(enrichmentQueueMutex);
   return true;
-}
-
-String latestBufferedObservationId(const String &address) {
-  String observationId;
-  xSemaphoreTake(observationBufferMutex, portMAX_DELAY);
-  for (size_t offset = 0; offset < bufferCount; offset++) {
-    size_t index = (bufferHead + OBSERVATION_BUFFER_SIZE - 1 - offset) % OBSERVATION_BUFFER_SIZE;
-    if (observationBuffer[index].address == address) {
-      observationId = observationBuffer[index].observationId;
-      break;
-    }
-  }
-  xSemaphoreGive(observationBufferMutex);
-  return observationId;
-}
-
-Observation *bufferedObservationByIdLocked(const String &observationId) {
-  for (size_t offset = 0; offset < bufferCount; offset++) {
-    size_t index = (bufferTail + offset) % OBSERVATION_BUFFER_SIZE;
-    if (observationBuffer[index].observationId == observationId) {
-      return &observationBuffer[index];
-    }
-  }
-  return nullptr;
-}
-
-void markBufferedObservationGattFailure(
-  const String &observationId,
-  const String &status,
-  const String &errorCode,
-  uint32_t durationMs
-) {
-  xSemaphoreTake(observationBufferMutex, portMAX_DELAY);
-  Observation *source = bufferedObservationByIdLocked(observationId);
-  if (source != nullptr) {
-    source->gattAttempted = true;
-    source->gattStatus = status;
-    source->gattErrorCode = errorCode;
-    source->gattAttemptDurationMs = durationMs;
-  }
-  xSemaphoreGive(observationBufferMutex);
 }
 
 void copyGattResult(Observation &destination, const Observation &source) {
@@ -1161,13 +1254,25 @@ void performGattEnrichment(GattWorkerContext *context) {
   releaseGattClient(context, client);
 }
 
-void gattWorkerTask(void *argument) {
-  GattWorkerContext *context = static_cast<GattWorkerContext *>(argument);
-  performGattEnrichment(context);
-  xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
-  context->done = true;
-  xSemaphoreGive(gattWorkerMutex);
-  vTaskDelete(nullptr);
+void gattWorkerTask(void *) {
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
+    GattWorkerContext *context = gattWorkerContext;
+    xSemaphoreGive(gattWorkerMutex);
+    if (context == nullptr) {
+      continue;
+    }
+    performGattEnrichment(context);
+    xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
+    if (context->terminalStatus.length() > 0) {
+      context->result.gattStatus = context->terminalStatus;
+      context->result.gattErrorCode = context->terminalErrorCode;
+      context->result.gattAttemptDurationMs = millis() - context->startedAt;
+    }
+    context->done = true;
+    xSemaphoreGive(gattWorkerMutex);
+  }
 }
 
 void cancelGattClientLocked(GattWorkerContext *context) {
@@ -1181,18 +1286,32 @@ void cancelGattClientLocked(GattWorkerContext *context) {
   }
 }
 
-void markGattSource(
-  GattWorkerContext *context,
-  const String &status,
-  const String &errorCode,
-  uint32_t durationMs
-) {
-  markBufferedObservationGattFailure(
-    context->sourceObservationId,
-    status,
-    errorCode,
-    durationMs
-  );
+bool gattResultIsPending() {
+  if (gattResultMutex == nullptr) {
+    return false;
+  }
+  xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+  bool pending = pendingGattEnrichment.ready;
+  xSemaphoreGive(gattResultMutex);
+  return pending;
+}
+
+void storeGattResult(GattWorkerContext *context) {
+  xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+  if (pendingGattEnrichment.ready) {
+    gattResultDroppedCount++;
+    xSemaphoreGive(gattResultMutex);
+    return;
+  }
+  pendingGattEnrichment.ready = true;
+  pendingGattEnrichment.queuedAt = millis();
+  pendingGattEnrichment.retryCount = 0;
+  pendingGattEnrichment.sourceObservationId = context->sourceObservationId;
+  pendingGattEnrichment.enrichedAt = isoNow();
+  pendingGattEnrichment.address = context->target.address;
+  pendingGattEnrichment.addressType = addressTypeName(context->target.addressType);
+  copyGattResult(pendingGattEnrichment.result, context->result);
+  xSemaphoreGive(gattResultMutex);
 }
 
 void processGattWorker() {
@@ -1203,7 +1322,6 @@ void processGattWorker() {
   GattWorkerContext *context = nullptr;
   bool timedOut = false;
   bool done = false;
-  bool abandoned = false;
   uint32_t durationMs = 0;
   xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
   context = gattWorkerContext;
@@ -1215,11 +1333,12 @@ void processGattWorker() {
       && durationMs >= GATT_OPERATION_TIMEOUT_MS
     ) {
       context->abandoned = true;
+      context->terminalStatus = "operation_timeout";
+      context->terminalErrorCode = "gatt_operation_timeout";
       timedOut = true;
       cancelGattClientLocked(context);
     }
     done = context->done;
-    abandoned = context->abandoned;
     if (done) {
       gattWorkerContext = nullptr;
     }
@@ -1229,21 +1348,25 @@ void processGattWorker() {
   if (context == nullptr) {
     return;
   }
-  if (timedOut) {
-    markGattSource(context, "operation_timeout", "gatt_operation_timeout", durationMs);
-  }
   if (!done) {
     return;
   }
-  if (!abandoned) {
-    xSemaphoreTake(observationBufferMutex, portMAX_DELAY);
-    Observation *source = bufferedObservationByIdLocked(context->sourceObservationId);
-    if (source != nullptr) {
-      copyGattResult(*source, context->result);
-    }
-    xSemaphoreGive(observationBufferMutex);
+  if (timedOut) {
+    context->result.gattStatus = "operation_timeout";
+    context->result.gattErrorCode = "gatt_operation_timeout";
+    context->result.gattAttemptDurationMs = durationMs;
   }
-  delete context;
+  storeGattResult(context);
+  portENTER_CRITICAL(&radioTelemetryMux);
+  if (context->result.gattStatus == "success") {
+    gattSuccessCount++;
+  } else {
+    gattFailureCount++;
+  }
+  if (context->result.gattStatus == "operation_timeout") {
+    gattTimeoutCount++;
+  }
+  portEXIT_CRITICAL(&radioTelemetryMux);
 }
 
 void abandonGattWorker(const String &status, const String &errorCode) {
@@ -1252,23 +1375,18 @@ void abandonGattWorker(const String &status, const String &errorCode) {
   }
 
   GattWorkerContext *context = nullptr;
-  uint32_t durationMs = 0;
-  bool changed = false;
   xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
   context = gattWorkerContext;
   if (context != nullptr && !context->done && !context->abandoned) {
     context->abandoned = true;
-    durationMs = millis() - context->startedAt;
+    context->terminalStatus = status;
+    context->terminalErrorCode = errorCode;
     cancelGattClientLocked(context);
-    changed = true;
   }
   xSemaphoreGive(gattWorkerMutex);
-  if (changed) {
-    markGattSource(context, status, errorCode, durationMs);
-  }
 }
 
-bool gattWorkerBlocksUpload() {
+bool gattWorkerIsActive() {
   if (gattWorkerMutex == nullptr) {
     return false;
   }
@@ -1281,7 +1399,12 @@ bool gattWorkerBlocksUpload() {
 }
 
 void enrichNextTarget() {
-  if (gattWorkerMutex == nullptr) {
+  if (
+    gattWorkerMutex == nullptr
+    || gattWorkerTaskHandle == nullptr
+    || trackingIsActive()
+    || gattResultIsPending()
+  ) {
     return;
   }
   xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
@@ -1295,51 +1418,27 @@ void enrichNextTarget() {
   if (!takeNextEnrichmentTarget(target)) {
     return;
   }
-  String sourceObservationId = latestBufferedObservationId(target.address);
-  if (sourceObservationId.length() == 0) {
+  if (target.sourceObservationId.length() == 0) {
     return;
   }
-  rememberEnrichmentAttempt(target.address, target.addressType);
 
-  GattWorkerContext *context = new GattWorkerContext();
-  if (context == nullptr) {
-    markBufferedObservationGattFailure(
-      sourceObservationId,
-      "connection_failed",
-      "worker_context_allocation_failed",
-      0
-    );
-    return;
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
   }
-  context->target = target;
-  context->sourceObservationId = sourceObservationId;
-  context->startedAt = millis();
+  trackingScanActive = false;
 
   xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
-  gattWorkerContext = context;
+  gattWorkerStorage = GattWorkerContext();
+  gattWorkerStorage.target = target;
+  gattWorkerStorage.sourceObservationId = target.sourceObservationId;
+  gattWorkerStorage.startedAt = millis();
+  gattWorkerContext = &gattWorkerStorage;
   xSemaphoreGive(gattWorkerMutex);
-  BaseType_t created = xTaskCreate(
-    gattWorkerTask,
-    "ble-gatt",
-    GATT_WORKER_STACK_SIZE,
-    context,
-    1,
-    nullptr
-  );
-  if (created != pdPASS) {
-    xSemaphoreTake(gattWorkerMutex, portMAX_DELAY);
-    if (gattWorkerContext == context) {
-      gattWorkerContext = nullptr;
-    }
-    xSemaphoreGive(gattWorkerMutex);
-    markBufferedObservationGattFailure(
-      sourceObservationId,
-      "connection_failed",
-      "worker_task_allocation_failed",
-      millis() - context->startedAt
-    );
-    delete context;
-  }
+  portENTER_CRITICAL(&radioTelemetryMux);
+  gattAttemptCount++;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  xTaskNotifyGive(gattWorkerTaskHandle);
 }
 
 bool waitForBridgeResponse(String &responseBody) {
@@ -1384,8 +1483,6 @@ bool httpRequestJson(const char *method, const String &path, JsonDocument &docum
   Serial.println("|||BRIDGE_START|||");
   Serial.println(method);
   Serial.println(path);
-  // Stream the document directly. Keeping a second 29 KB String copy here
-  // can exhaust the ESP32 heap and emit a truncated JSON body.
   serializeJson(document, Serial);
   Serial.println();
   Serial.println("|||BRIDGE_END|||");
@@ -1401,24 +1498,28 @@ bool httpRequestJson(const char *method, const String &path, JsonDocument &docum
   return ok;
 }
 
-void fetchConfig() {
+bool fetchConfig() {
   String response;
-  httpRequest("GET", String("/api/scanners/") + SCANNER_ID + "/config", "", response);
+  return httpRequest("GET", String("/api/scanners/") + SCANNER_ID + "/config", "", response);
 }
 
-void sendHeartbeat() {
+bool sendHeartbeat() {
   TrackingConfig tracking = snapshotTrackingConfig();
-  DynamicJsonDocument doc(2048);
+  StaticJsonDocument<6144> doc;
   doc["message_id"] = makeId("hb");
   doc["scanner_time"] = isoNow();
   doc["uptime_seconds"] = millis() / 1000;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["hardware_version"] = HARDWARE_VERSION;
+  doc["reset_reason"] = resetReasonName(esp_reset_reason());
   doc["config_version"] = scannerConfig.configVersion;
   doc["config_status"] = "applied";
   JsonObject health = doc.createNestedObject("health");
   health["free_heap"] = ESP.getFreeHeap();
   health["min_free_heap"] = ESP.getMinFreeHeap();
+  health["largest_free_block"] = ESP.getMaxAllocHeap();
+  health["heap_size"] = ESP.getHeapSize();
+  health["reset_reason"] = resetReasonName(esp_reset_reason());
   health["boot_id"] = bootId;
   health["monotonic_ms"] = millis();
   health["time_source"] = timeSource();
@@ -1463,17 +1564,214 @@ void sendHeartbeat() {
   );
   health["pending_observations"] = pendingObservations;
   health["dropped_observations"] = droppedObservations;
+  health["observation_buffer_high_watermark"] = observationBufferHighWatermark;
+  uint32_t telemetryScanCycle = 0;
+  uint32_t telemetryScanStarts = 0;
+  uint32_t telemetryScanRestarts = 0;
+  uint32_t telemetryScanWindows = 0;
+  uint32_t telemetryEmptyWindows = 0;
+  uint32_t telemetryCallbacks = 0;
+  uint32_t telemetryAccepted = 0;
+  uint32_t telemetryLastAdvertisementAt = 0;
+  uint32_t telemetryGattRejected = 0;
+  uint32_t telemetryGattAttempts = 0;
+  uint32_t telemetryGattSuccesses = 0;
+  uint32_t telemetryGattFailures = 0;
+  uint32_t telemetryGattTimeouts = 0;
+  portENTER_CRITICAL(&radioTelemetryMux);
+  telemetryScanCycle = scanCycle;
+  telemetryScanStarts = scanStartCount;
+  telemetryScanRestarts = scanRestartCount;
+  telemetryScanWindows = scanWindowCount;
+  telemetryEmptyWindows = scanEmptyWindowCount;
+  telemetryCallbacks = scanCallbackCount;
+  telemetryAccepted = scanAcceptedObservationCount;
+  telemetryLastAdvertisementAt = lastAdvertisementAt;
+  telemetryGattRejected = gattAdmissionRejectedCount;
+  telemetryGattAttempts = gattAttemptCount;
+  telemetryGattSuccesses = gattSuccessCount;
+  telemetryGattFailures = gattFailureCount;
+  telemetryGattTimeouts = gattTimeoutCount;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  health["radio_state"] = scan->isScanning()
+    ? "scanning"
+    : (gattWorkerIsActive() ? "gatt_enrichment" : "stopped");
+  health["scan_cycle"] = telemetryScanCycle;
+  health["scan_start_count"] = telemetryScanStarts;
+  health["scan_restart_count"] = telemetryScanRestarts;
+  health["scan_window_count"] = telemetryScanWindows;
+  health["scan_empty_window_count"] = telemetryEmptyWindows;
+  health["scan_callback_count"] = telemetryCallbacks;
+  health["scan_accepted_observation_count"] = telemetryAccepted;
+  health["last_advertisement_age_ms"] = telemetryLastAdvertisementAt == 0
+    ? 0
+    : millis() - telemetryLastAdvertisementAt;
+  xSemaphoreTake(enrichmentQueueMutex, portMAX_DELAY);
+  health["gatt_queue_depth"] = enrichmentQueueCount;
+  xSemaphoreGive(enrichmentQueueMutex);
+  health["gatt_admission_rejected_count"] = telemetryGattRejected;
+  health["gatt_attempt_count"] = telemetryGattAttempts;
+  health["gatt_success_count"] = telemetryGattSuccesses;
+  health["gatt_failure_count"] = telemetryGattFailures;
+  health["gatt_timeout_count"] = telemetryGattTimeouts;
+  health["gatt_result_dropped_count"] = gattResultDroppedCount;
+  xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+  health["gatt_result_pending"] = pendingGattEnrichment.ready;
+  health["gatt_result_retry_count"] = pendingGattEnrichment.retryCount;
+  health["gatt_result_age_ms"] = pendingGattEnrichment.ready
+    ? millis() - pendingGattEnrichment.queuedAt
+    : 0;
+  xSemaphoreGive(gattResultMutex);
+  health["transport_stack_high_watermark"] = uxTaskGetStackHighWaterMark(nullptr);
+  health["gatt_stack_high_watermark"] = gattWorkerTaskHandle == nullptr
+    ? 0
+    : uxTaskGetStackHighWaterMark(gattWorkerTaskHandle);
   health["transport_request_sequence"] = transportRequestSequence;
   health["transport_last_path"] = transportLastPath;
   health["transport_last_status"] = transportLastStatus;
   health["transport_last_duration_ms"] = transportLastDurationMs;
   health["transport_timeout_count"] = transportTimeoutCount;
   health["transport_failure_count"] = transportFailureCount;
+  health["transport_backlog_drain_count"] = transportBacklogDrainCount;
+  health["serial_control_overflow_count"] = serialControlOverflowCount;
+  health["upload_json_overflow_count"] = uploadJsonOverflowCount;
+  health["upload_oversized_observation_drop_count"] = uploadOversizedObservationDropCount;
 
-  String body;
-  serializeJson(doc, body);
+  if (doc.overflowed()) {
+    transportFailureCount++;
+    return false;
+  }
   String response;
-  httpRequest("POST", String("/api/scanners/") + SCANNER_ID + "/heartbeat", body, response);
+  return httpRequestJson(
+    "POST",
+    String("/api/scanners/") + SCANNER_ID + "/heartbeat",
+    doc,
+    response
+  );
+}
+
+void writeGattEnrichmentPayload(JsonObject gatt, const Observation &item) {
+  gatt["status"] = item.gattStatus;
+  if (item.gattErrorCode.length()) gatt["error_code"] = item.gattErrorCode;
+  if (item.gattDeviceName.length()) gatt["device_name"] = item.gattDeviceName;
+  if (item.gattManufacturerName.length()) gatt["manufacturer_name"] = item.gattManufacturerName;
+  if (item.gattModelNumber.length()) gatt["model_number"] = item.gattModelNumber;
+  if (item.gattSerialNumber.length()) gatt["serial_number"] = item.gattSerialNumber;
+  if (item.gattFirmwareRevision.length()) gatt["firmware_revision"] = item.gattFirmwareRevision;
+  if (item.gattHardwareRevision.length()) gatt["hardware_revision"] = item.gattHardwareRevision;
+  if (item.gattSoftwareRevision.length()) gatt["software_revision"] = item.gattSoftwareRevision;
+  if (item.gattSystemIdHex.length()) gatt["system_id"] = item.gattSystemIdHex;
+  if (item.gattPnpIdHex.length()) gatt["pnp_id"] = item.gattPnpIdHex;
+  gatt["attempt_duration_ms"] = item.gattAttemptDurationMs;
+
+  JsonArray services = gatt.createNestedArray("discovered_services");
+  int serviceStart = 0;
+  while (serviceStart < item.gattDiscoveredServices.length()) {
+    int comma = item.gattDiscoveredServices.indexOf(',', serviceStart);
+    if (comma < 0) {
+      services.add(item.gattDiscoveredServices.substring(serviceStart));
+      break;
+    }
+    services.add(item.gattDiscoveredServices.substring(serviceStart, comma));
+    serviceStart = comma + 1;
+  }
+
+  JsonObject values = gatt.createNestedObject("characteristic_values");
+  int valueStart = 0;
+  while (valueStart < item.gattCharacteristicValues.length()) {
+    int comma = item.gattCharacteristicValues.indexOf(',', valueStart);
+    String entry = comma < 0
+      ? item.gattCharacteristicValues.substring(valueStart)
+      : item.gattCharacteristicValues.substring(valueStart, comma);
+    int separator = entry.indexOf('=');
+    if (separator > 0) {
+      values[entry.substring(0, separator)] = entry.substring(separator + 1);
+    }
+    if (comma < 0) break;
+    valueStart = comma + 1;
+  }
+}
+
+bool uploadGattEnrichment() {
+  if (!gattResultIsPending()) {
+    return true;
+  }
+  StaticJsonDocument<12288> doc;
+  String sourceObservationId;
+  xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+  if (!pendingGattEnrichment.ready) {
+    xSemaphoreGive(gattResultMutex);
+    return true;
+  }
+  sourceObservationId = pendingGattEnrichment.sourceObservationId;
+  doc["report_id"] = String("gatt-") + sourceObservationId;
+  doc["source_observation_id"] = sourceObservationId;
+  doc["enriched_at"] = pendingGattEnrichment.enrichedAt;
+  doc["address"] = pendingGattEnrichment.address;
+  doc["address_type"] = pendingGattEnrichment.addressType;
+  JsonObject gatt = doc.createNestedObject("gatt_enrichment");
+  writeGattEnrichmentPayload(gatt, pendingGattEnrichment.result);
+  xSemaphoreGive(gattResultMutex);
+
+  if (doc.overflowed()) {
+    transportFailureCount++;
+    xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+    if (
+      pendingGattEnrichment.ready
+      && pendingGattEnrichment.sourceObservationId == sourceObservationId
+    ) {
+      pendingGattEnrichment.retryCount++;
+      if (millis() - pendingGattEnrichment.queuedAt >= GATT_RESULT_MAX_AGE_MS) {
+        pendingGattEnrichment = PendingGattEnrichment();
+        gattResultDroppedCount++;
+      }
+    }
+    xSemaphoreGive(gattResultMutex);
+    return false;
+  }
+  String response;
+  bool ok = httpRequestJson(
+    "POST",
+    String("/api/scanners/") + SCANNER_ID + "/enrichments",
+    doc,
+    response
+  );
+  if (ok) {
+    xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+    if (
+      pendingGattEnrichment.ready
+      && pendingGattEnrichment.sourceObservationId == sourceObservationId
+    ) {
+      pendingGattEnrichment = PendingGattEnrichment();
+    }
+    xSemaphoreGive(gattResultMutex);
+  } else {
+    xSemaphoreTake(gattResultMutex, portMAX_DELAY);
+    if (
+      pendingGattEnrichment.ready
+      && pendingGattEnrichment.sourceObservationId == sourceObservationId
+    ) {
+      pendingGattEnrichment.retryCount++;
+      bool permanentRejection = transportLastStatus == 400
+        || transportLastStatus == 404
+        || transportLastStatus == 422;
+      bool expired = millis() - pendingGattEnrichment.queuedAt >= GATT_RESULT_MAX_AGE_MS;
+      if (permanentRejection || expired) {
+        pendingGattEnrichment = PendingGattEnrichment();
+        gattResultDroppedCount++;
+      }
+    }
+    xSemaphoreGive(gattResultMutex);
+  }
+  return ok;
+}
+
+size_t observationFrameCapacity() {
+  return max<size_t>(
+    1,
+    min<size_t>(scannerConfig.maxBatchSize, MAX_SERIAL_FRAME_OBSERVATIONS)
+  );
 }
 
 bool uploadBatch() {
@@ -1495,10 +1793,10 @@ bool uploadBatch() {
     if (pendingObservationCount == 0) {
       return true;
     }
-    pendingBatchSize = min<size_t>(
-      pendingObservationCount,
-      min<size_t>(scannerConfig.maxBatchSize, MAX_SERIAL_FRAME_OBSERVATIONS)
-    );
+    size_t frameCapacity = pendingBatchSize > 0
+      ? pendingBatchSize
+      : observationFrameCapacity();
+    pendingBatchSize = min<size_t>(pendingObservationCount, frameCapacity);
     pendingBatchId = makeId("batch");
     pendingBatchSequence = ++batchSequence;
   }
@@ -1507,12 +1805,9 @@ bool uploadBatch() {
     pendingBatchId = "";
     return true;
   }
-  // Allocate for the frame being sent instead of reserving 64 KB on every
-  // upload. A fixed 64 KB allocation becomes unavailable after NimBLE and the
-  // bounded observation buffer occupy their normal runtime heap.
-  size_t documentCapacity = UPLOAD_JSON_BASE_CAPACITY
-    + batchSize * UPLOAD_JSON_PER_OBSERVATION_CAPACITY;
-  DynamicJsonDocument doc(documentCapacity);
+
+  constexpr size_t documentCapacity = OBSERVATION_UPLOAD_JSON_CAPACITY;
+  StaticJsonDocument<OBSERVATION_UPLOAD_JSON_CAPACITY> doc;
   doc["batch_id"] = pendingBatchId;
   doc["batch_sequence"] = pendingBatchSequence;
   doc["boot_id"] = bootId;
@@ -1652,14 +1947,24 @@ bool uploadBatch() {
   }
 
   if (doc.overflowed() || doc["batch_id"].isNull() || observations.size() != batchSize) {
+    uploadJsonOverflowCount++;
+    pendingBatchId = "";
     if (batchSize > 1) {
       pendingBatchSize = max<size_t>(1, batchSize / 2);
+    } else {
+      for (size_t index = 1; index < pendingObservationCount; index++) {
+        pendingObservationBuffer[index - 1] = pendingObservationBuffer[index];
+      }
+      pendingObservationCount--;
+      pendingBatchSize = 0;
+      droppedObservations++;
+      uploadOversizedObservationDropCount++;
     }
     Serial.printf(
-      "[firmware] Upload JSON allocation failed or overflowed (items=%u, capacity=%u, free_heap=%u). Retrying a smaller frame.\n",
+      "[firmware] Observation frame serialization failed (items=%u, capacity=%u, largest_block=%u).\n",
       static_cast<unsigned int>(batchSize),
       static_cast<unsigned int>(documentCapacity),
-      static_cast<unsigned int>(ESP.getFreeHeap())
+      static_cast<unsigned int>(ESP.getMaxAllocHeap())
     );
     return false;
   }
@@ -1758,6 +2063,12 @@ bool uploadTrackingBatch() {
 
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *device) override {
+    uint32_t callbackAt = millis();
+    portENTER_CRITICAL(&radioTelemetryMux);
+    scanCallbackCount++;
+    lastAdvertisementAt = callbackAt;
+    uint32_t callbackScanCycle = scanCycle;
+    portEXIT_CRITICAL(&radioTelemetryMux);
     int rssi = device->getRSSI();
     String address = String(device->getAddress().toString().c_str());
     address.toLowerCase();
@@ -1771,7 +2082,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       : String("");
     bool hasName = advertisedName.length() > 0;
     const std::vector<uint8_t> &payload = device->getPayload();
-    if (!allowTrackingNormalObservation(address, hasName, payload.size())) {
+    if (!allowNormalObservation(address, hasName, payload.size(), callbackScanCycle)) {
       return;
     }
 
@@ -1780,8 +2091,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     observation.observedAt = isoNow();
     observation.timeSource = timeSource();
     observation.bootId = bootId;
-    observation.monotonicMs = millis();
-    observation.scanCycle = scanCycle;
+    observation.monotonicMs = callbackAt;
+    observation.scanCycle = callbackScanCycle;
     observation.clockSyncAgeMs = clockSyncAgeMs();
     observation.address = address;
     observation.addressType = addressType;
@@ -1834,13 +2145,19 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       serviceList += String(device->getServiceUUID(i).toString().c_str());
     }
     observation.serviceUuids = serviceList;
-    pushObservation(observation);
-    if (observation.connectable && !trackingIsActive()) {
+    bool accepted = pushObservation(observation);
+    if (accepted) {
+      portENTER_CRITICAL(&radioTelemetryMux);
+      scanAcceptedObservationCount++;
+      portEXIT_CRITICAL(&radioTelemetryMux);
+    }
+    if (accepted && observation.connectable && !trackingIsActive()) {
       queueEnrichmentTarget(
         observation.address,
         device->getAddressType(),
         observation.rssi,
-        observation.advertisedName.length() > 0
+        observation.advertisedName.length() > 0,
+        observation.observationId
       );
     }
   }
@@ -1850,45 +2167,73 @@ void setupBle() {
   NimBLEDevice::init("");
   NimBLEScan *scan = NimBLEDevice::getScan();
   scanCallbacks = new ScanCallbacks();
-  scan->setScanCallbacks(scanCallbacks, false);
+  scan->setScanCallbacks(scanCallbacks, true);
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(90);
   scan->setMaxResults(0);
 }
 
-void runScan() {
-  NimBLEScan *scan = NimBLEDevice::getScan();
-  normalUploadReady = false;
-  scanCycle++;
-  scan->getResults(SCAN_DURATION_SECONDS * 1000UL, false);
-  scan->clearResults();
-  enrichNextTarget();
-  normalUploadReady = true;
-}
-
-void startTrackingScan() {
+bool startContinuousScan(bool recovery) {
   NimBLEScan *scan = NimBLEDevice::getScan();
   if (scan->isScanning()) {
-    scan->stop();
+    trackingScanActive = trackingIsActive();
+    return true;
   }
   scan->setScanCallbacks(scanCallbacks, true);
   scan->setActiveScan(true);
   scan->clearResults();
-  scanCycle++;
-  lastTrackingCycleAt = millis();
-  trackingScanActive = scan->start(0, false, true);
-  normalUploadReady = true;
+  uint32_t startedAt = millis();
+  bool started = scan->start(0, false, true);
+  portENTER_CRITICAL(&radioTelemetryMux);
+  scanStartCount++;
+  if (recovery) scanRestartCount++;
+  lastScanStartedAt = startedAt;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  trackingScanActive = started && trackingIsActive();
+  return started;
 }
 
-void stopTrackingScan() {
-  NimBLEScan *scan = NimBLEDevice::getScan();
-  if (scan->isScanning()) {
-    scan->stop();
+void rollScanWindow(uint32_t now) {
+  if (now - lastScanAt < scannerConfig.scanIntervalMs) {
+    return;
   }
-  scan->setScanCallbacks(scanCallbacks, false);
+  lastScanAt = now;
+  portENTER_CRITICAL(&radioTelemetryMux);
+  scanWindowCount++;
+  if (scanCallbackCount == lastScanWindowCallbackCount) {
+    scanEmptyWindowCount++;
+  }
+  lastScanWindowCallbackCount = scanCallbackCount;
+  scanCycle++;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+}
+
+void superviseContinuousScan(uint32_t now) {
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  if (gattWorkerIsActive()) {
+    return;
+  }
+  if (!scan->isScanning()) {
+    startContinuousScan(true);
+    return;
+  }
+  portENTER_CRITICAL(&radioTelemetryMux);
+  uint32_t callbacks = scanCallbackCount;
+  uint32_t lastAdvertisement = lastAdvertisementAt;
+  uint32_t scanStarted = lastScanStartedAt;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  bool noAdvertisementSinceStart = callbacks == 0
+    && now - scanStarted >= SCAN_SILENCE_RECOVERY_MS;
+  bool advertisementsStopped = callbacks > 0
+    && now - lastAdvertisement >= SCAN_SILENCE_RECOVERY_MS
+    && now - scanStarted >= SCAN_SILENCE_RECOVERY_MS;
+  if (!noAdvertisementSinceStart && !advertisementsStopped) {
+    return;
+  }
+  scan->stop();
   scan->clearResults();
-  trackingScanActive = false;
+  startContinuousScan(true);
 }
 
 void applyTrackingModeChange() {
@@ -1899,64 +2244,99 @@ void applyTrackingModeChange() {
   TrackingConfig tracking = snapshotTrackingConfig();
   if (tracking.active) {
     abandonGattWorker("cancelled", "tracking_focus_started");
-    if (!trackingScanActive) {
-      startTrackingScan();
-    }
     lastTrackingUploadAt = millis();
   } else {
-    stopTrackingScan();
-    normalUploadReady = false;
-    lastScanAt = millis() - scannerConfig.scanIntervalMs;
+    lastScanAt = millis();
   }
+  trackingScanActive = tracking.active && NimBLEDevice::getScan()->isScanning();
+}
+
+size_t observationBacklogCount() {
+  size_t pending = pendingObservationCount;
+  xSemaphoreTake(observationBufferMutex, portMAX_DELAY);
+  pending += bufferCount;
+  xSemaphoreGive(observationBufferMutex);
+  return pending;
+}
+
+bool trackingUploadPending() {
+  if (pendingTrackingBatchSize > 0 || pendingTrackingBatchId.length() > 0) {
+    return true;
+  }
+  portENTER_CRITICAL(&trackingBufferMux);
+  bool pending = trackingBufferCount > 0;
+  portEXIT_CRITICAL(&trackingBufferMux);
+  return pending;
 }
 
 void transportTask(void *) {
   uint32_t lastUploadAt = 0;
   uint32_t lastHeartbeatAt = 0;
   uint32_t lastConfigAt = 0;
-
-  fetchConfig();
-  lastConfigAt = millis();
-  sendHeartbeat();
-  lastHeartbeatAt = millis();
+  uint32_t lastGattUploadAt = 0;
+  uint8_t consecutiveTrackingUploads = 0;
 
   while (true) {
     pollSerialControl();
-    TrackingConfig tracking = snapshotTrackingConfig();
+    TrackingSchedule tracking = snapshotTrackingSchedule();
     uint32_t now = millis();
     uint32_t configRefreshInterval = tracking.active
       ? TRACKING_CONFIG_REFRESH_INTERVAL_MS
       : CONFIG_REFRESH_INTERVAL_MS;
 
-    if (now - lastConfigAt >= configRefreshInterval) {
-      lastConfigAt = now;
-      fetchConfig();
-      now = millis();
-    }
+    bool heartbeatDue = lastHeartbeatAt == 0
+      || now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
+    bool configDue = lastConfigAt == 0
+      || now - lastConfigAt >= configRefreshInterval;
+    bool configHardDue = lastConfigAt == 0
+      || now - lastConfigAt >= configRefreshInterval * 2;
+    bool trackingDue = tracking.active
+      && trackingUploadPending()
+      && (lastTrackingUploadAt == 0 || now - lastTrackingUploadAt >= tracking.uploadIntervalMs);
+    size_t observationBacklog = observationBacklogCount();
+    bool observationRetryPending = pendingBatchId.length() > 0;
+    bool observationBacklogDue = !observationRetryPending
+      && observationBacklog > observationFrameCapacity();
+    bool observationDue = observationBacklog > 0
+      && (
+        observationBacklogDue
+        || lastUploadAt == 0
+        || now - lastUploadAt >= scannerConfig.uploadIntervalMs
+      );
+    bool gattDue = gattResultIsPending()
+      && (lastGattUploadAt == 0 || now - lastGattUploadAt >= TRANSPORT_RETRY_BACKOFF_MS);
 
-    if (
-      tracking.active
-      && now - lastTrackingUploadAt >= tracking.uploadIntervalMs
-    ) {
-      lastTrackingUploadAt = now;
-      uploadTrackingBatch();
-      now = millis();
-    }
-
-    bool stagedBatch = pendingObservationCount > 0;
-    bool mayStageBatch = (tracking.active || normalUploadReady) && !gattWorkerBlocksUpload();
-    if (
-      now - lastUploadAt >= scannerConfig.uploadIntervalMs
-      && (stagedBatch || mayStageBatch)
-    ) {
-      lastUploadAt = now;
-      uploadBatch();
-      now = millis();
-    }
-
-    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      lastHeartbeatAt = now;
+    if (heartbeatDue) {
       sendHeartbeat();
+      lastHeartbeatAt = millis();
+      consecutiveTrackingUploads = 0;
+    } else if (configHardDue) {
+      fetchConfig();
+      lastConfigAt = millis();
+      consecutiveTrackingUploads = 0;
+    } else if (trackingDue && consecutiveTrackingUploads < 2) {
+      uploadTrackingBatch();
+      lastTrackingUploadAt = millis();
+      consecutiveTrackingUploads++;
+    } else if (observationDue) {
+      if (observationBacklogDue) {
+        transportBacklogDrainCount++;
+      }
+      uploadBatch();
+      lastUploadAt = millis();
+      consecutiveTrackingUploads = 0;
+    } else if (gattDue) {
+      uploadGattEnrichment();
+      lastGattUploadAt = millis();
+      consecutiveTrackingUploads = 0;
+    } else if (configDue) {
+      fetchConfig();
+      lastConfigAt = millis();
+      consecutiveTrackingUploads = 0;
+    } else if (trackingDue) {
+      uploadTrackingBatch();
+      lastTrackingUploadAt = millis();
+      consecutiveTrackingUploads = 1;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1964,18 +2344,24 @@ void transportTask(void *) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Tracking configuration plus its ACK can exceed the default UART RX ring during a response burst.
+  Serial.setRxBufferSize(SERIAL_RX_BUFFER_SIZE);
+  Serial.begin(SERIAL_BAUD_RATE);
   uint64_t hardwareId = ESP.getEfuseMac();
   bootId = String("boot-") + String(static_cast<uint32_t>(hardwareId >> 32), HEX)
     + String(static_cast<uint32_t>(hardwareId), HEX) + "-" + String(esp_random(), HEX);
   observationBufferMutex = xSemaphoreCreateMutex();
   trackingConfigMutex = xSemaphoreCreateMutex();
   serialControlMutex = xSemaphoreCreateMutex();
+  enrichmentQueueMutex = xSemaphoreCreateMutex();
+  gattResultMutex = xSemaphoreCreateMutex();
   gattWorkerMutex = xSemaphoreCreateMutex();
   if (
     observationBufferMutex == nullptr
     || trackingConfigMutex == nullptr
     || serialControlMutex == nullptr
+    || enrichmentQueueMutex == nullptr
+    || gattResultMutex == nullptr
   ) {
     Serial.println("[firmware] Fatal: transport synchronization allocation failed.");
     while (true) {
@@ -1986,6 +2372,27 @@ void setup() {
     Serial.println("[firmware] GATT enrichment disabled: mutex allocation failed.");
   }
   setupBle();
+  if (gattWorkerMutex != nullptr) {
+    BaseType_t gattWorkerCreated = xTaskCreate(
+      gattWorkerTask,
+      "ble-gatt",
+      GATT_WORKER_STACK_SIZE,
+      nullptr,
+      1,
+      &gattWorkerTaskHandle
+    );
+    if (gattWorkerCreated != pdPASS) {
+      gattWorkerTaskHandle = nullptr;
+      Serial.println("[firmware] GATT enrichment disabled: worker task allocation failed.");
+    }
+  }
+  portENTER_CRITICAL(&radioTelemetryMux);
+  scanCycle = 1;
+  portEXIT_CRITICAL(&radioTelemetryMux);
+  lastScanAt = millis();
+  if (!startContinuousScan(false)) {
+    Serial.println("[firmware] BLE scan start failed; supervisor will retry.");
+  }
   BaseType_t transportCreated = xTaskCreate(
     transportTask,
     "transport",
@@ -2007,25 +2414,12 @@ void loop() {
   processGattWorker();
   applyTrackingModeChange();
   uint32_t now = millis();
-
-  TrackingConfig tracking = snapshotTrackingConfig();
-  if (tracking.active) {
-    NimBLEScan *scan = NimBLEDevice::getScan();
-    if (!scan->isScanning()) {
-      startTrackingScan();
-      now = millis();
-    }
-    if (now - lastTrackingCycleAt >= scannerConfig.scanIntervalMs) {
-      scanCycle++;
-      lastTrackingCycleAt = now;
-    }
-  } else {
-    if (now - lastScanAt >= scannerConfig.scanIntervalMs) {
-      lastScanAt = now;
-      runScan();
-      processGattWorker();
-      now = millis();
-    }
+  rollScanWindow(now);
+  superviseContinuousScan(now);
+  bool trackingActive = trackingIsActive();
+  trackingScanActive = trackingActive && NimBLEDevice::getScan()->isScanning();
+  if (!trackingActive && NimBLEDevice::getScan()->isScanning()) {
+    enrichNextTarget();
   }
 
   delay(20);

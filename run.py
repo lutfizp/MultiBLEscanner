@@ -150,7 +150,7 @@ def main() -> None:
                     "--port",
                     os.getenv("ESP32_SERIAL_PORT", "auto"),
                     "--baud",
-                    os.getenv("ESP32_SERIAL_BAUD", "115200"),
+                    os.getenv("ESP32_SERIAL_BAUD", "230400"),
                     *(
                         ["--ca-file", str(tls["ca"])]
                         if tls
@@ -189,6 +189,7 @@ def main() -> None:
             host=host,
             port=port,
             reload=False,
+            access_log=os.getenv("UVICORN_ACCESS_LOG", "false").lower() in {"1", "true", "yes", "on"},
             ssl_certfile=str(tls["cert"]) if tls else None,
             ssl_keyfile=str(tls["key"]) if tls else None,
         )
