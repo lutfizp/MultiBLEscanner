@@ -9,6 +9,7 @@ The implementation preserves the distinction between measured data and inference
 - raw advertising and scan-response bytes are retained;
 - parsed AD structures record their source and parse status;
 - GATT values are stored separately as direct enrichment reads;
+- official Flipper Zero serial-profile UUIDs are classified from verified raw advertisements and exposed with their supporting evidence;
 - randomized addresses remain separate unless an approved evidence path or operator decision links them;
 - RSSI produces radial signal evidence, not a bearing or exact indoor coordinate;
 - a device location point is the scanner-location snapshot where the device was observed, not the physical Bluetooth transmitter coordinate.
@@ -99,7 +100,7 @@ The firmware performs active BLE scans and emits framed request messages over US
 - returns backend status and configuration responses to the firmware;
 - reconnects after temporary USB detachments.
 
-Firmware release `esp32-ble-scanner-1.6.9` targets the detected ESP32-D0WD-V3 board and pins NimBLE-Arduino 2.5.0. It runs continuous asynchronous active scanning, captures separate ADV and scan-response payloads down to the practical `-110 dBm` receiver floor, admits at most one normal record per address in each scan window, uses a bounded 96-observation RAM queue, keeps IDs stable across retries and unique across scanner boots, and uploads at most 12 normal observations per serial frame. Configuration, heartbeat, serial framing, HTTP acknowledgement waits, and upload retries run in a dedicated 32 KB FreeRTOS transport task with deadline-aware scheduling. Observation batches, heartbeats, and GATT reports use fixed stack-backed JSON documents and serialize directly to USB instead of allocating a second complete body in heap. When queued observations exceed one frame, acknowledged frames drain consecutively until the backlog is bounded; a local content-capacity failure retries a smaller unsent slice, while an immutable frame that reached transport observes the configured retry interval. Firmware and bridge use `230400` baud; 12-item frames and the observation-idempotency database index keep transport above the measured radio admission rate without the sustained frame corruption observed at `460800`. A 4 KB UART receive ring and matching bounded control line prevent focused-tracking configuration responses from displacing their HTTP acknowledgement. The host forwarding deadline remains 8 seconds and the firmware ACK deadline remains 12 seconds. Eligible GATT Device Name and Device Information reads use one persistent worker, strong-candidate admission, cooldown and heap guards, and a six-second operation budget. GATT results upload separately against the original boot-scoped observation ID and never delay raw advertisement delivery. The reader does not force pairing; protected values are reported as `security_required`.
+Firmware release `esp32-ble-scanner-1.7.0` targets the detected ESP32-D0WD-V3 board and pins NimBLE-Arduino 2.5.0. It runs continuous asynchronous active scanning, captures separate ADV and scan-response payloads down to the practical `-110 dBm` receiver floor, admits at most one normal record per address in each scan window, uses a bounded 96-observation RAM queue, keeps IDs stable across retries and unique across scanner boots, and uploads at most 12 normal observations per serial frame. Configuration, heartbeat, serial framing, HTTP acknowledgement waits, and upload retries run in a dedicated 32 KB FreeRTOS transport task with deadline-aware scheduling. Observation batches, heartbeats, and GATT reports use fixed stack-backed JSON documents and serialize directly to USB instead of allocating a second complete body in heap. Radio observations and GATT worker output use separate firmware structures; GATT results are never embedded in an observation batch. When queued observations exceed one frame, acknowledged frames drain consecutively until the backlog is bounded; a local content-capacity failure retries a smaller unsent slice, while an immutable frame that reached transport observes the configured retry interval. Firmware and bridge use `230400` baud; 12-item frames and the observation-idempotency database index keep transport above the measured radio admission rate without the sustained frame corruption observed at `460800`. A 4 KB UART receive ring and matching bounded control line prevent focused-tracking configuration responses from displacing their HTTP acknowledgement. The host forwarding deadline remains 8 seconds and the firmware ACK deadline remains 12 seconds. Eligible GATT Device Name and Device Information reads use one persistent worker, strong-candidate admission, cooldown and heap guards, and a six-second operation budget. GATT results upload separately against the original boot-scoped observation ID and never delay raw advertisement delivery. The reader does not force pairing; protected values are reported as `security_required`.
 
 When the backend assigns a focused tracking session, the existing continuous scanner also captures duplicate advertisements for only the accepted address/address-type pairs of the selected logical device. It emits dedicated RSSI samples every 200 ms at most and uploads them separately from normal observations. A valid current focus sample refreshes presence for that exact already-accepted identity, including median-filtered RSSI and return state. It cannot create a device, run correlation, infer movement, or move a durable location anchor.
 
@@ -155,6 +156,8 @@ A raw observed identity represents an address and its captured Bluetooth evidenc
 - Unresolved random/private addresses expire as `identity_expired`; they are not presented as confirmed offline physical devices.
 - The Devices and Location views hide unresolved manufacturer-only random broadcasts by default. A random advertiser with a directly captured Local Name remains visible as a named candidate, but it is not promoted to durable identity.
 - Bluetooth SIG Company Identifier identifies a manufacturer-data namespace, not necessarily the product manufacturer or owner.
+- A raw-verified `0x3081`, `0x3082`, or `0x3083` serial-profile advertisement is labeled `Confirmed Flipper Zero` with its black, white, or transparent hardware variant. The API also returns the rule ID, verification scope, and evidence used for the label.
+- Generic HID, Nordic UART, device names, and address prefixes do not independently trigger the Flipper Zero label.
 - Similar names, RSSI, service UUIDs, company IDs, and payload layouts do not automatically prove physical identity.
 - Direct GATT names and model values improve display information but are not automatically unique identifiers.
 - Apple Continuity TLVs, short-lived tag carryover, Handoff IV continuity, time, RSSI, and GATT model can produce an auditable possible-match proposal. This path never auto-merges or claims confirmed physical identity.
@@ -185,18 +188,6 @@ The bundled test console intentionally has no login and must not be deployed as 
 
 The current ESP32 transport is USB serial. A scanner in another location requires a host computer at that location running `serial_bridge.py` against a reachable central backend, or a separately implemented and tested direct network transport. The supplied firmware does not currently upload HTTPS by itself.
 
-## Documentation
-
-- `docs/engineering-guide.md`: backend architecture, module responsibilities, invariants, data model, processing, extension points, and maintenance procedures.
-- `docs/api.md`: backend HTTP endpoints, authentication, payload rules, filtering, and response semantics.
-- `docs/operations.md`: backend installation, firmware transport, deployment, backup, recovery, second-scanner deployment, and troubleshooting.
-- `docs/testing.md`: backend, migration, transport, and real-hardware validation.
-- `docs/calibration.md`: RSSI evidence, published model provenance, and physical limits.
-- `docs/correlation.md`: address-rotation evidence paths and acceptance policy.
-- `docs/privacy.md`: authorized use and operational privacy boundaries.
-- `docs/project-structure.md`: source tree ownership.
-- `CHANGELOG.md`: phase-by-phase implementation and validation history.
-
 ## Repository Hygiene
 
-`.gitignore` excludes local secrets, databases, firmware configuration, virtual environments, build output, runtime locks, logs, and vendor/reference Markdown. Root `README.md`, `CHANGELOG.md`, and backend documentation under `docs/` are repository-eligible. `docs/phase-1-requirement-analysis.md` and `docs/phase-2-technical-design.md` remain explicitly ignored. Git ignore rules do not untrack files that were committed before the rule existed.
+`.gitignore` excludes local secrets, databases, firmware configuration, virtual environments, build output, runtime locks, logs, local documentation, and reference projects. Only root `README.md` and `CHANGELOG.md` are repository-tracked Markdown. Runtime backend modules, migrations, setup and runner entry points, transport code, and automated tests remain tracked project code.

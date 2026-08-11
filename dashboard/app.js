@@ -180,6 +180,20 @@ function badge(value) {
   return `<span class="badge ${tone}">${escapeHtml(label)}</span>`;
 }
 
+function deviceClassificationBadge(classification) {
+  if (classification?.product_class !== "flipper_zero") return "";
+  const variant = classification.variant ? ` · ${classification.variant}` : "";
+  return `<span class="badge product-confirmed">${escapeHtml(`${classification.label}${variant}`)}</span>`;
+}
+
+function deviceClassificationEvidence(classification) {
+  const evidence = classification?.evidence || [];
+  if (!evidence.length) return "No retained classification evidence";
+  return evidence
+    .map((item) => `${String(item.type || "evidence").replaceAll("_", " ")}: ${item.value ?? "-"}`)
+    .join(" · ");
+}
+
 function statusDot(status) {
   const normalized = String(status || "unknown").toLowerCase();
   const tone = normalized === "offline" ? "offline" : normalized === "temporarily_missing" ? "warning" : "online";
@@ -358,6 +372,9 @@ function renderDevices() {
         device.current_zone,
         device.vendor,
         device.category,
+        device.device_classification?.label,
+        device.device_classification?.variant,
+        device.device_classification?.profile,
         device.gatt_enrichment?.manufacturer_name,
         device.gatt_enrichment?.model_number,
       ]
@@ -371,7 +388,7 @@ function renderDevices() {
       return `<tr data-device-id="${device.id}" class="${selected.trim()}">
         <td><strong>${escapeHtml(name)}</strong><br><small>${escapeHtml(formatNameSource(device.display_name_source))} · ${escapeHtml(device.primary_address || "-")}</small></td>
         <td>${badge(device.status)}</td>
-        <td>${escapeHtml(device.vendor || "-")}<br><small>${escapeHtml(device.category || "-")}</small></td>
+        <td>${escapeHtml(device.vendor || "-")}<br><small>${escapeHtml(device.category || "-")}</small>${device.device_classification ? `<span class="classification-line">${deviceClassificationBadge(device.device_classification)}</span>` : ""}</td>
         <td>${badge(device.movement_status)}</td>
         <td>${escapeHtml(device.current_scanner_id || "-")}</td>
         <td>${escapeHtml(device.current_zone || "-")}</td>
@@ -421,6 +438,9 @@ async function showDeviceDetail(deviceId) {
   const gatt = device.gatt_enrichment || null;
   const trackingThisDevice = state.tracking.session?.logical_device_id === device.id;
   const selectedMode = trackingThisDevice ? state.tracking.session.mode : state.tracking.mode;
+  const mergeTargets = state.devices.filter((candidate) => (
+    candidate.id !== device.id && candidate.status !== "merged"
+  ));
   const panel = $("#deviceDetail");
   panel.classList.remove("hidden");
   panel.innerHTML = `
@@ -428,6 +448,7 @@ async function showDeviceDetail(deviceId) {
       <div class="detail-heading">
         <h2 id="deviceDialogTitle">${escapeHtml(device.alias || device.display_name || "Device detail")}</h2>
         <small>${escapeHtml(device.primary_address || "No observed address")}</small>
+        ${device.device_classification ? `<span class="classification-line">${deviceClassificationBadge(device.device_classification)}</span>` : ""}
       </div>
       <div class="detail-actions">
         <button data-correlation-action="mark_known">Known</button>
@@ -449,6 +470,9 @@ async function showDeviceDetail(deviceId) {
       ${kv("Movement", badge(device.movement_status))}
       ${kv("SIG Company", escapeHtml(device.vendor ? `${device.vendor}${device.manufacturer_company_id ? ` (${device.manufacturer_company_id})` : ""}` : "Not raw-verified"))}
       ${kv("Category", escapeHtml(device.category || "-"))}
+      ${kv("Product identification", device.device_classification ? deviceClassificationBadge(device.device_classification) : "Not classified")}
+      ${kv("Identification method", escapeHtml(device.device_classification?.verification_scope?.replaceAll("_", " ") || "-"))}
+      ${kv("Identification evidence", escapeHtml(deviceClassificationEvidence(device.device_classification)))}
       ${kv("Name source", escapeHtml(formatNameSource(device.display_name_source)))}
       ${kv("GATT status", gatt ? badge(gatt.status) : "Not attempted")}
       ${kv("GATT manufacturer", escapeHtml(gatt?.manufacturer_name || "-"))}
@@ -469,6 +493,23 @@ async function showDeviceDetail(deviceId) {
       ${kv("First seen", formatDate(device.first_seen_at))}
       ${kv("Last seen", formatDate(device.last_seen_at))}
     </div>
+    <h3>Operator Metadata</h3>
+    <form id="deviceMetadataForm" class="device-metadata-form">
+      <label>Alias <input name="alias" maxlength="180" value="${escapeHtml(device.alias || "")}"></label>
+      <label>Tags <input name="tags" maxlength="500" value="${escapeHtml((device.tags || []).join(", "))}"></label>
+      <label class="metadata-notes">Notes <textarea name="notes" maxlength="10000" rows="3">${escapeHtml(device.notes || "")}</textarea></label>
+      <label class="checkline"><input name="known" type="checkbox" ${device.known ? "checked" : ""}> Known device</label>
+      <button type="submit" class="primary-action">Save Metadata</button>
+    </form>
+    <h3>Identity Record</h3>
+    <form id="deviceMergeForm" class="device-merge-form">
+      <select name="target_device_id" aria-label="Canonical merge target" ${mergeTargets.length ? "" : "disabled"}>
+        <option value="">Select canonical device</option>
+        ${mergeTargets.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(candidate.alias || candidate.display_name || candidate.primary_address || candidate.id)}</option>`).join("")}
+      </select>
+      <button type="submit" ${mergeTargets.length ? "" : "disabled"}>Merge Into Target</button>
+    </form>
+    <span id="deviceOperatorError" class="inline-error"></span>
     <h3>Signal History</h3>
     <canvas id="signalChart" width="720" height="180"></canvas>
     <h3>Observed Identities</h3>
@@ -477,10 +518,12 @@ async function showDeviceDetail(deviceId) {
         <strong>${escapeHtml(identity.address || "No address")}</strong>
         <span>${escapeHtml(identity.address_type || "-")} ${identity.randomized_address ? "randomized" : ""}</span>
         <span>${escapeHtml(formatManufacturerEvidence(identity))}</span>
+        ${identity.device_classification ? `<span class="classification-line">${deviceClassificationBadge(identity.device_classification)}</span><small>${escapeHtml(deviceClassificationEvidence(identity.device_classification))}</small>` : ""}
         ${identity.manufacturer_profile?.find_my ? `<span>Find My: ${escapeHtml(identity.manufacturer_profile.find_my.payload_type)} · battery ${escapeHtml(identity.manufacturer_profile.find_my.battery_status)}</span>` : ""}
         ${identity.manufacturer_profile?.airdrop ? `<span>Apple Nearby/AirDrop-style payload</span>` : ""}
         ${(identity.manufacturer_profile?.continuity_subtypes || []).length ? `<span>Apple Continuity: ${escapeHtml(identity.manufacturer_profile.continuity_subtypes.join(", "))}</span>` : ""}
         <small>${escapeHtml((identity.service_uuids || []).join(", "))}</small>
+        ${detail.observed_identities.length > 1 ? `<button type="button" data-split-identity="${escapeHtml(identity.id)}">Split Identity</button>` : ""}
       </div>`).join("")}</div>
     <h3>Direct Device Information</h3>
     <div class="event-list">${(detail.device_enrichments || []).map((enrichment) => `
@@ -504,6 +547,10 @@ async function showDeviceDetail(deviceId) {
         <strong>${escapeHtml(formatCorrelationMethod(correlation.method))}</strong>
         <span>${badge(correlation.status)} · ${escapeHtml(correlationEvidenceSummary(correlation))}</span>
         <small>${escapeHtml(correlationMetrics(correlation))}</small>
+        ${correlation.status === "proposal" && correlation.successor_logical_device_id === device.id ? `<div class="correlation-actions">
+          <button type="button" data-review-correlation="accept_proposal" data-correlation-id="${escapeHtml(correlation.id)}">Accept Match</button>
+          <button type="button" data-review-correlation="reject_proposal" data-correlation-id="${escapeHtml(correlation.id)}">Reject Match</button>
+        </div>` : ""}
       </div>`).join("") || "<div class=\"event-item\">No accepted or statistical identity correlation.</div>"}</div>
     <h3>Location History</h3>
     <div class="event-list">${(detail.location_history || []).map((location) => `
@@ -526,6 +573,61 @@ async function showDeviceDetail(deviceId) {
       });
       await showDeviceDetail(device.id);
       await loadDevices();
+    });
+  });
+  panel.querySelector("#deviceMetadataForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const errorNode = panel.querySelector("#deviceOperatorError");
+    errorNode.textContent = "";
+    try {
+      await api(`/api/devices/${device.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          alias: form.elements.alias.value,
+          notes: form.elements.notes.value,
+          tags: form.elements.tags.value.split(",").map((tag) => tag.trim()).filter(Boolean),
+          known: form.elements.known.checked,
+        }),
+      });
+      await loadDevices();
+      await showDeviceDetail(device.id);
+    } catch (error) {
+      errorNode.textContent = error.message;
+    }
+  });
+  panel.querySelector("#deviceMergeForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const targetId = event.currentTarget.elements.target_device_id.value;
+    if (!targetId || !window.confirm("Merge this device and all attributable history into the selected target?")) return;
+    await runDeviceCorrelationAction({
+      source_logical_device_id: device.id,
+      target_logical_device_id: targetId,
+      action: "merge",
+    }, device.id);
+  });
+  panel.querySelectorAll("[data-split-identity]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("Split this observed identity into its own logical device?")) return;
+      await runDeviceCorrelationAction({
+        source_logical_device_id: device.id,
+        observed_identity_id: button.dataset.splitIdentity,
+        action: "split",
+      }, device.id);
+    });
+  });
+  panel.querySelectorAll("[data-review-correlation]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const accepting = button.dataset.reviewCorrelation === "accept_proposal";
+      const prompt = accepting
+        ? "Accept this possible match and merge both logical-device histories?"
+        : "Reject this possible identity match?";
+      if (!window.confirm(prompt)) return;
+      await runDeviceCorrelationAction({
+        source_logical_device_id: device.id,
+        correlation_id: button.dataset.correlationId,
+        action: button.dataset.reviewCorrelation,
+      }, device.id);
     });
   });
   panel.querySelectorAll("[data-tracking-mode]").forEach((button) => {
@@ -551,6 +653,22 @@ async function showDeviceDetail(deviceId) {
   });
   openDeviceDrawer();
   drawSignalChart(detail.recent_observations || []);
+}
+
+async function runDeviceCorrelationAction(payload, fallbackDeviceId) {
+  const errorNode = $("#deviceOperatorError");
+  if (errorNode) errorNode.textContent = "";
+  try {
+    const result = await api("/api/devices/correlation", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    await Promise.all([loadDevices(), loadMapDevices(), loadOverview()]);
+    const resultDeviceId = result.device?.id || result.canonical_device_id || result.split_device_id || fallbackDeviceId;
+    await showDeviceDetail(resultDeviceId);
+  } catch (error) {
+    if (errorNode) errorNode.textContent = error.message;
+  }
 }
 
 function formatIdentityBasis(basis) {
@@ -908,6 +1026,7 @@ function deviceStackPopup(devices) {
       return `<button type="button" class="map-device-button" data-map-device-id="${escapeHtml(device.id)}">
         <span>${statusDot(device.status)}<strong>${escapeHtml(name)}</strong></span>
         <small>${escapeHtml(device.primary_address || "-")} · ${escapeHtml(String(device.status || "unknown").replaceAll("_", " "))}</small>
+        ${device.device_classification ? `<span class="map-device-classification">${deviceClassificationBadge(device.device_classification)}</span>` : ""}
       </button>`;
     }).join("");
   return `<div class="map-device-popup"><div class="map-device-popup-title">${devices.length} anchored device${devices.length === 1 ? "" : "s"}</div>${rows}</div>`;
@@ -2246,7 +2365,7 @@ function connectLive() {
   state.live = source;
   source.addEventListener("connected", () => setLiveState("Connected", "good"));
   source.addEventListener("ping", () => setLiveState("Connected", "good"));
-  ["scanner_heartbeat", "scanner_position_updated", "observations_ingested", "device_enrichment_recorded", "scanner_updated", "device_correlation_changed", "device_tracking_changed", "runtime_state_changed"].forEach((type) => {
+  ["scanner_heartbeat", "scanner_position_updated", "observations_ingested", "device_enrichment_recorded", "device_metadata_updated", "scanner_updated", "device_correlation_changed", "device_tracking_changed", "runtime_state_changed"].forEach((type) => {
     source.addEventListener(type, scheduleLiveRefresh);
   });
   source.onerror = () => {

@@ -38,7 +38,9 @@ struct Observation {
   size_t advertisingPacketLength = 0;
   size_t scanResponsePacketLength = 0;
   bool connectable = false;
-  bool gattAttempted = false;
+};
+
+struct GattEnrichmentResult {
   String gattStatus;
   String gattErrorCode;
   String gattDeviceName;
@@ -108,7 +110,7 @@ struct TrackingNormalDeviceSlot {
 struct GattWorkerContext {
   EnrichmentTarget target;
   String sourceObservationId;
-  Observation result;
+  GattEnrichmentResult result;
   NimBLEClient *client = nullptr;
   uint32_t startedAt = 0;
   bool done = false;
@@ -134,7 +136,7 @@ struct PendingGattEnrichment {
   String enrichedAt;
   String address;
   String addressType;
-  Observation result;
+  GattEnrichmentResult result;
 };
 
 class ScanCallbacks;
@@ -855,8 +857,7 @@ bool takeNextEnrichmentTarget(EnrichmentTarget &target) {
   return true;
 }
 
-void copyGattResult(Observation &destination, const Observation &source) {
-  destination.gattAttempted = source.gattAttempted;
+void copyGattResult(GattEnrichmentResult &destination, const GattEnrichmentResult &source) {
   destination.gattStatus = source.gattStatus;
   destination.gattErrorCode = source.gattErrorCode;
   destination.gattDeviceName = source.gattDeviceName;
@@ -883,7 +884,7 @@ void appendCsvValue(String &list, const String &value) {
   list += value;
 }
 
-void appendGattCharacteristic(Observation &observation, const char *uuid, const String &hexValue) {
+void appendGattCharacteristic(GattEnrichmentResult &observation, const char *uuid, const String &hexValue) {
   if (hexValue.length() == 0) {
     return;
   }
@@ -1033,7 +1034,7 @@ bool readGattCharacteristic(
   NimBLEClient *client,
   NimBLERemoteService *service,
   const char *characteristicUuid,
-  Observation &observation,
+  GattEnrichmentResult &observation,
   String *textValue,
   String *binaryHexValue,
   bool &securityRequired,
@@ -1094,8 +1095,7 @@ void releaseGattClient(GattWorkerContext *context, NimBLEClient *client) {
 }
 
 void performGattEnrichment(GattWorkerContext *context) {
-  Observation &observation = context->result;
-  observation.gattAttempted = true;
+  GattEnrichmentResult &observation = context->result;
   NimBLEClient *client = NimBLEDevice::createClient();
   if (client == nullptr) {
     observation.gattStatus = "connection_failed";
@@ -1651,7 +1651,7 @@ bool sendHeartbeat() {
   );
 }
 
-void writeGattEnrichmentPayload(JsonObject gatt, const Observation &item) {
+void writeGattEnrichmentPayload(JsonObject gatt, const GattEnrichmentResult &item) {
   gatt["status"] = item.gattStatus;
   if (item.gattErrorCode.length()) gatt["error_code"] = item.gattErrorCode;
   if (item.gattDeviceName.length()) gatt["device_name"] = item.gattDeviceName;
@@ -1880,70 +1880,6 @@ bool uploadBatch() {
     obs["advertising_packet_length"] = item.advertisingPacketLength;
     obs["scan_response_packet_length"] = item.scanResponsePacketLength;
     obs["payload_layout_version"] = 2;
-    if (item.gattAttempted) {
-      JsonObject gatt = obs.createNestedObject("gatt_enrichment");
-      gatt["status"] = item.gattStatus;
-      if (item.gattErrorCode.length()) {
-        gatt["error_code"] = item.gattErrorCode;
-      }
-      if (item.gattDeviceName.length()) {
-        gatt["device_name"] = item.gattDeviceName;
-      }
-      if (item.gattManufacturerName.length()) {
-        gatt["manufacturer_name"] = item.gattManufacturerName;
-      }
-      if (item.gattModelNumber.length()) {
-        gatt["model_number"] = item.gattModelNumber;
-      }
-      if (item.gattSerialNumber.length()) {
-        gatt["serial_number"] = item.gattSerialNumber;
-      }
-      if (item.gattFirmwareRevision.length()) {
-        gatt["firmware_revision"] = item.gattFirmwareRevision;
-      }
-      if (item.gattHardwareRevision.length()) {
-        gatt["hardware_revision"] = item.gattHardwareRevision;
-      }
-      if (item.gattSoftwareRevision.length()) {
-        gatt["software_revision"] = item.gattSoftwareRevision;
-      }
-      if (item.gattSystemIdHex.length()) {
-        gatt["system_id"] = item.gattSystemIdHex;
-      }
-      if (item.gattPnpIdHex.length()) {
-        gatt["pnp_id"] = item.gattPnpIdHex;
-      }
-      gatt["attempt_duration_ms"] = item.gattAttemptDurationMs;
-
-      JsonArray gattServices = gatt.createNestedArray("discovered_services");
-      int serviceStart = 0;
-      while (serviceStart < item.gattDiscoveredServices.length()) {
-        int comma = item.gattDiscoveredServices.indexOf(',', serviceStart);
-        if (comma < 0) {
-          gattServices.add(item.gattDiscoveredServices.substring(serviceStart));
-          break;
-        }
-        gattServices.add(item.gattDiscoveredServices.substring(serviceStart, comma));
-        serviceStart = comma + 1;
-      }
-
-      JsonObject characteristicValues = gatt.createNestedObject("characteristic_values");
-      int valueStart = 0;
-      while (valueStart < item.gattCharacteristicValues.length()) {
-        int comma = item.gattCharacteristicValues.indexOf(',', valueStart);
-        String entry = comma < 0
-          ? item.gattCharacteristicValues.substring(valueStart)
-          : item.gattCharacteristicValues.substring(valueStart, comma);
-        int separator = entry.indexOf('=');
-        if (separator > 0) {
-          characteristicValues[entry.substring(0, separator)] = entry.substring(separator + 1);
-        }
-        if (comma < 0) {
-          break;
-        }
-        valueStart = comma + 1;
-      }
-    }
   }
 
   if (doc.overflowed() || doc["batch_id"].isNull() || observations.size() != batchSize) {

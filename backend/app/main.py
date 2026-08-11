@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
+import logging
 from threading import Lock
 import time
 from typing import Annotated
@@ -18,8 +19,10 @@ from .config import Settings, get_settings
 from .database import SessionLocal, get_db
 from .models import Scanner
 from .realtime import broker, tracking_broker
+from .retention import cleanup_retained_history
 from .schemas import (
     BrowserLocationDiagnosticIn,
+    DevicePatchIn,
     GATTEnrichmentReportIn,
     HeartbeatIn,
     ManualCorrelationIn,
@@ -46,6 +49,7 @@ from .services import (
     list_scanners,
     overview,
     patch_scanner,
+    patch_device_metadata,
     patch_settings,
     process_batch,
     record_gatt_enrichment,
@@ -60,7 +64,6 @@ from .tracking import (
     TrackingConflictError,
     TrackingNotFoundError,
     TrackingValidationError,
-    cleanup_tracking_history,
     get_tracking_session,
     ingest_tracking_samples,
     record_tracking_heartbeat,
@@ -106,8 +109,6 @@ def require_scanner(
     return scanner
 
 
-import logging
-
 logger = logging.getLogger("scanner_status")
 
 def refresh_runtime_state_once(*, run_tracking_cleanup: bool = False) -> dict[str, object]:
@@ -115,7 +116,7 @@ def refresh_runtime_state_once(*, run_tracking_cleanup: bool = False) -> dict[st
         settings = get_settings()
         runtime_event_count = len(refresh_presence_states(db, settings)) + len(refresh_scanner_states(db, settings))
         tracking_changes = refresh_tracking_states(db)
-        cleanup = cleanup_tracking_history(db) if run_tracking_cleanup else None
+        cleanup = cleanup_retained_history(db, settings) if run_tracking_cleanup else None
         return {
             "runtime_event_count": runtime_event_count,
             "tracking_changes": tracking_changes,
@@ -328,6 +329,24 @@ def api_device_detail(
     return detail
 
 
+@app.patch("/api/devices/{device_id}")
+def api_patch_device(
+    device_id: str,
+    payload: DevicePatchIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    result = patch_device_metadata(db, device_id, payload)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="device not found")
+    background_tasks.add_task(
+        broker.publish,
+        "device_metadata_updated",
+        {"device_id": device_id},
+    )
+    return result
+
+
 @app.post("/api/devices/{device_id}/tracking-sessions")
 def api_start_tracking_session(
     device_id: str,
@@ -466,9 +485,10 @@ def api_manual_correlation(
     payload: ManualCorrelationIn,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
     try:
-        result = apply_manual_correlation(db, payload)
+        result = apply_manual_correlation(db, payload, settings)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     background_tasks.add_task(broker.publish, "device_correlation_changed", result)
@@ -536,7 +556,10 @@ def api_patch_settings(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    result = patch_settings(db, payload)
+    try:
+        result = patch_settings(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     background_tasks.add_task(
         broker.publish,
         "settings_updated",

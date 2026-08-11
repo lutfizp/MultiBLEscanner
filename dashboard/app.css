@@ -472,6 +472,17 @@ tbody tr:last-child td {
   color: #942338;
 }
 
+.badge.product-confirmed {
+  border-color: #78b7bd;
+  background: #e5f4f5;
+  color: #075d66;
+}
+
+.classification-line {
+  display: block;
+  margin-top: 5px;
+}
+
 .proximity-meta {
   display: block;
   max-width: 340px;
@@ -729,6 +740,43 @@ body.drawer-open {
 
 .detail-panel > h3 {
   margin: 20px 0 8px;
+}
+
+.device-metadata-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+
+.device-metadata-form label:not(.checkline) {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.device-metadata-form .metadata-notes {
+  grid-column: 1 / -1;
+}
+
+.device-merge-form,
+.correlation-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.device-merge-form select {
+  min-width: 0;
+}
+
+.device-merge-form button,
+.correlation-actions button {
+  flex: 0 0 auto;
 }
 
 .detail-panel canvas,
@@ -1063,6 +1111,11 @@ body.drawer-open {
   overflow-wrap: anywhere;
 }
 
+.map-device-button .map-device-classification {
+  display: block;
+  margin-top: 2px;
+}
+
 .local-coverage {
   min-width: 0;
 }
@@ -1239,8 +1292,20 @@ body.drawer-open {
   }
 
   .detail-grid,
-  .diagnostics-grid {
+  .diagnostics-grid,
+  .device-metadata-form {
     grid-template-columns: 1fr;
+  }
+
+  .device-merge-form,
+  .correlation-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .device-merge-form button,
+  .correlation-actions button {
+    width: 100%;
   }
 
   .kv:nth-child(odd) {

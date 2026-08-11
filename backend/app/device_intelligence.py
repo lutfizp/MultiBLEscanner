@@ -37,6 +37,17 @@ SERVICE_UUID_CATEGORY = {
 }
 
 
+FLIPPER_ZERO_SERIAL_VARIANTS = {
+    "3081": "black",
+    "3082": "white",
+    "3083": "transparent",
+}
+
+FLIPPER_ZERO_GATT_SERIAL_SERVICE = "8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000"
+FLIPPER_ZERO_GATT_MANUFACTURER = "flipper devices inc"
+FLIPPER_ZERO_PUBLIC_ADDRESS_PREFIXES = ("80:e1:26", "80:e1:27")
+
+
 NAME_CATEGORY = {
     "buds": "audio_headphones",
     "airpods": "audio_headphones",
@@ -203,6 +214,158 @@ def short_uuid(uuid_value: str) -> str:
     if value.startswith(prefix) and value.endswith(suffix) and len(value) >= 8:
         return value[4:8]
     return value
+
+
+def _normalized_manufacturer_name(value: str | None) -> str:
+    return (value or "").strip().casefold().rstrip(".")
+
+
+def classify_flipper_zero(
+    *,
+    service_uuids: list[str] | None = None,
+    capture_verified: bool = False,
+    name: str | None = None,
+    address: str | None = None,
+    address_type: str | None = None,
+    tx_power: int | None = None,
+    advertising_type: str | None = None,
+    connectable: bool | None = None,
+    advertising_flags: dict[str, Any] | None = None,
+    gatt_manufacturer_name: str | None = None,
+    gatt_services: list[str] | None = None,
+    observation_count: int | None = None,
+) -> dict[str, Any] | None:
+
+    advertised_services = {short_uuid(value) for value in service_uuids or []}
+    matched_serial_uuid = next(
+        (value for value in FLIPPER_ZERO_SERIAL_VARIANTS if value in advertised_services),
+        None,
+    )
+    normalized_gatt_services = {
+        value.strip().casefold()
+        for value in gatt_services or []
+        if isinstance(value, str)
+    }
+    gatt_verified = (
+        _normalized_manufacturer_name(gatt_manufacturer_name)
+        == FLIPPER_ZERO_GATT_MANUFACTURER
+        and FLIPPER_ZERO_GATT_SERIAL_SERVICE in normalized_gatt_services
+    )
+    advertisement_verified = capture_verified and matched_serial_uuid is not None
+    if not advertisement_verified and not gatt_verified:
+        return None
+
+    evidence: list[dict[str, Any]] = []
+    if advertisement_verified:
+        evidence.append(
+            {
+                "type": "official_serial_service_uuid",
+                "value": f"0x{matched_serial_uuid}",
+                "source": "verified_raw_advertising",
+            }
+        )
+    if gatt_verified:
+        evidence.extend(
+            [
+                {
+                    "type": "gatt_manufacturer_name",
+                    "value": gatt_manufacturer_name,
+                    "source": "ble_gatt",
+                },
+                {
+                    "type": "official_gatt_serial_service",
+                    "value": FLIPPER_ZERO_GATT_SERIAL_SERVICE,
+                    "source": "ble_gatt",
+                },
+            ]
+        )
+
+    flags = advertising_flags or {}
+    if capture_verified and tx_power == 0:
+        evidence.append(
+            {
+                "type": "advertised_tx_power",
+                "value": "0 dBm",
+                "source": "verified_raw_advertising",
+            }
+        )
+    if (
+        capture_verified
+        and flags.get("general_discoverable_mode")
+        and flags.get("br_edr_not_supported")
+    ):
+        evidence.append(
+            {
+                "type": "gap_flags",
+                "value": "0x06",
+                "source": "verified_raw_advertising",
+            }
+        )
+    if (
+        capture_verified
+        and connectable is True
+        and (advertising_type or "").strip().casefold() == "adv_ind"
+    ):
+        evidence.append(
+            {
+                "type": "advertising_profile",
+                "value": "connectable ADV_IND",
+                "source": "radio_metadata",
+            }
+        )
+    if capture_verified and (name or "").strip().casefold().startswith("flipper"):
+        evidence.append(
+            {
+                "type": "advertised_name",
+                "value": name,
+                "source": "verified_raw_advertising",
+            }
+        )
+
+    normalized_address = (address or "").strip().casefold()
+    normalized_address_type = (address_type or "").strip().casefold()
+    if (
+        normalized_address_type == "public"
+        and normalized_address.startswith(FLIPPER_ZERO_PUBLIC_ADDRESS_PREFIXES)
+    ):
+        evidence.append(
+            {
+                "type": "public_address_pattern",
+                "value": normalized_address,
+                "source": "radio_metadata",
+            }
+        )
+    if observation_count is not None and observation_count > 1:
+        evidence.append(
+            {
+                "type": "repeated_observations",
+                "value": observation_count,
+                "source": "backend_history",
+            }
+        )
+
+    variant = (
+        FLIPPER_ZERO_SERIAL_VARIANTS.get(matched_serial_uuid)
+        if matched_serial_uuid
+        else None
+    )
+    return {
+        "product_class": "flipper_zero",
+        "label": "Confirmed Flipper Zero",
+        "variant": variant,
+        "profile": "serial_rpc",
+        "confidence_tier": "confirmed",
+        "rule_id": "flipper_zero_official_ble_v1",
+        "verification_scope": (
+            "passive_advertisement_and_gatt"
+            if advertisement_verified and gatt_verified
+            else "passive_advertisement_fingerprint"
+            if advertisement_verified
+            else "active_gatt_fingerprint"
+        ),
+        "spoofable": True,
+        "evidence": evidence,
+    }
 
 
 def infer_device_category(name: str | None, service_uuids: list[str] | None, manufacturer_data: str | None = None) -> str | None:

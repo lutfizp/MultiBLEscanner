@@ -5,7 +5,7 @@ from math import ceil
 from statistics import median
 from typing import Any
 
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -18,7 +18,6 @@ from .models import (
     ObservedIdentity,
     Scanner,
     ScannerConfiguration,
-    SystemSetting,
 )
 from .processing import ensure_utc, utcnow
 from .schemas import TrackingPositionIn, TrackingSampleBatchIn, TrackingSessionCreateIn
@@ -885,55 +884,3 @@ def refresh_tracking_states(db: Session) -> list[dict[str, Any]]:
     if changed:
         db.commit()
     return changed
-
-
-def cleanup_tracking_history(db: Session, *, batch_size: int = 1000) -> dict[str, int]:
-    now = utcnow()
-    raw_setting = db.get(SystemSetting, "raw_observation_retention_days")
-    summary_setting = db.get(SystemSetting, "summary_retention_days")
-    raw_days = max(1, int(raw_setting.value if raw_setting is not None else 30))
-    summary_days = max(raw_days, int(summary_setting.value if summary_setting is not None else 365))
-
-    sample_ids = select(DeviceTrackingSample.id).where(
-        DeviceTrackingSample.observed_at < now - timedelta(days=raw_days)
-    ).limit(batch_size)
-    position_ids = select(DeviceTrackingPosition.id).where(
-        DeviceTrackingPosition.observed_at < now - timedelta(days=raw_days)
-    ).limit(batch_size)
-    deleted_samples = db.execute(
-        delete(DeviceTrackingSample).where(DeviceTrackingSample.id.in_(sample_ids))
-    ).rowcount or 0
-    deleted_positions = db.execute(
-        delete(DeviceTrackingPosition).where(DeviceTrackingPosition.id.in_(position_ids))
-    ).rowcount or 0
-
-    old_session_ids = list(
-        db.execute(
-            select(DeviceTrackingSession.id)
-            .where(
-                DeviceTrackingSession.ended_at.is_not(None),
-                DeviceTrackingSession.ended_at < now - timedelta(days=summary_days),
-            )
-            .limit(batch_size)
-        ).scalars()
-    )
-    deleted_sessions = 0
-    if old_session_ids:
-        db.execute(
-            delete(DeviceTrackingSample).where(DeviceTrackingSample.session_id.in_(old_session_ids))
-        )
-        db.execute(
-            delete(DeviceTrackingPosition).where(DeviceTrackingPosition.session_id.in_(old_session_ids))
-        )
-        db.execute(
-            delete(DeviceTrackingScanner).where(DeviceTrackingScanner.session_id.in_(old_session_ids))
-        )
-        deleted_sessions = db.execute(
-            delete(DeviceTrackingSession).where(DeviceTrackingSession.id.in_(old_session_ids))
-        ).rowcount or 0
-    db.commit()
-    return {
-        "tracking_samples": deleted_samples,
-        "tracking_positions": deleted_positions,
-        "tracking_sessions": deleted_sessions,
-    }

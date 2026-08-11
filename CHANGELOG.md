@@ -153,11 +153,6 @@ Validation:
 - `GET /dashboard/` returned HTTP 200.
 - Simulator with `local-dev-scanner-token` ingested 6 observations with 0 processing errors.
 
-Notes:
-
-- The ESP32 has no GPS by default, so automatic scanner location uses browser geolocation from the dashboard.
-- With one scanner, Bluetooth device points are proximity estimates around the scanner location, not exact device coordinates.
-
 ## Update: Reference-Based BLE Intelligence
 
 Changed:
@@ -179,11 +174,6 @@ Validation:
 - Simulator validation succeeded with idempotent duplicate handling.
 - `GET /api/devices` shows enriched vendor/category data.
 
-Notes:
-
-- MetaRadar's active GATT deep analysis was reviewed but not enabled by default because it can increase scan time, power usage, pairing prompts, and scanner visibility.
-- Go Haystack's Find My network integration was reviewed but not adopted because this project is a local BLE scanner, not a Find My client.
-
 ## Update: Real Map And Live Development Mode
 
 Changed:
@@ -201,11 +191,6 @@ Validation:
 - Leaflet CSS, JS, and marker images are present locally.
 - Map endpoint `GET /dashboard/` serves successfully.
 - Development simulator keeps scanner heartbeat and scan observations live during `python3 run.py`.
-
-Notes:
-
-- OpenStreetMap map tiles and Nominatim address lookup require browser internet access.
-- Bluetooth scan result markers are proximity estimates around the scanner. Exact GPS for scanned BLE devices still requires more location sources than one ESP32 scanner can provide.
 
 ## Update: Dashboard State Stability
 
@@ -248,11 +233,6 @@ Validation:
 - `PYTHONPYCACHEPREFIX=/private/tmp/bluetooth_scanner_pycache python3 -m compileall backend simulator tests run.py serial_bridge.py` passed.
 - `python3 -m pytest tests` passed: 13 tests.
 - `node --check dashboard/app.js` passed.
-
-Notes:
-
-- `simulator/simulator.py` remains available for optional tests, but `run.py` no longer starts it.
-- Bluetooth device map markers are still proximity estimates around the scanner. Exact BLE device coordinates require more than one scanner or another location source.
 
 ## Update: Timezone And Reference Recheck
 
@@ -477,12 +457,6 @@ Validation:
 - `node --check dashboard/app.js` passed.
 - `python3 -m platformio run --project-dir firmware` passed for `esp32dev`: Flash 46.8%, RAM 22.6%.
 
-Limits:
-
-- AD fields strengthen classification and retain possible static identifiers, but they do not by themselves prove that two different randomized addresses are one physical device.
-- USB host time is only as correct as the connected Mac clock. The backend labels fallback ordering instead of treating stale scanner time as factual.
-- GATT enrichment and IRK/RPA resolution are intentionally not enabled in this phase; both require explicit authorization and separate device-access policy.
-
 ## Phase: Correlation And RSSI Evidence Review
 
 Changed:
@@ -522,12 +496,6 @@ Validation:
 - `PYTHONPYCACHEPREFIX=/private/tmp/bluetooth_scanner_pycache python3 -m compileall -q backend tests run.py serial_bridge.py read_serial.py diagnose_esp32.py test_esp32.py` passed.
 - `node --check dashboard/app.js` passed.
 - `DATABASE_URL=sqlite:////private/tmp/bluetooth_scanner_correlation_migration_final.sqlite python3 -m alembic -c alembic.ini upgrade head` completed through `0003`.
-
-Limits:
-
-- An approved AD token is only as strong as the operator's protocol-specific evidence that it is stable and unique. It is not inferred from vendor, name, UUID, RSSI, location, or ordinary advertising similarity.
-- The RSSI-time cost is not an identity probability and is not validated for this ESP32 deployment by the paper's reported experiment. It remains a review proposal until local labelled validation establishes an acceptable false-link rate.
-- One scanner cannot determine device direction or a geographic device coordinate from RSSI. Exact multi-scanner positioning remains a future calibrated deployment capability.
 
 ## Update: Uncalibrated Signal Presentation And Status Markers
 
@@ -587,11 +555,6 @@ Validation:
 - Live API output showed signal bands, `estimated_distance_m: null`, `distance_range_m: null`, `distance_available: false`, and `location_confidence: 0`.
 - The server and USB bridge were stopped after verification. Final runtime counts are zero for observations, observed identities, logical devices, location estimates, events, heartbeats, and processing errors. Scanner `scn_dev_lab_001` remains registered.
 
-Limits:
-
-- This method intentionally does not answer “how many meters” or “which room” from one ESP32. Research on BLE proximity supports sequence filtering and classification, but absolute distance remains dependent on transmitter, orientation, antenna, and environment; a universal meter formula would be misleading.
-- A Bluetooth Classic-only TWS can still be absent because the current firmware discovers BLE advertisements. That is a separate scanning capability from this signal-processing change.
-
 ## Phase: Real ESP32 Transport And SQLite Reliability
 
 Changed:
@@ -615,11 +578,6 @@ Validation:
 - The latest 120 live observations were all payload layout v2 with verified raw-capture provenance. They contained 114 private/random addresses and 117 unnamed advertisements, which are real radio observations but not evidence of the same number of physical devices.
 - Under live ESP32 ingestion, `/api/devices` returned HTTP 200 in 0.057 seconds, `/api/overview` in 0.030 seconds, and `/api/diagnostics` in 0.006 seconds. No SQLite lock or invalid-payload error was reported.
 
-Limits:
-
-- A BLE advertisement with a randomized address is a real received radio identity, but it cannot be counted as a distinct physical device without stronger continuity evidence.
-- This scanner currently performs BLE discovery. A Classic Bluetooth-only headset/TWS can be absent unless it is advertising BLE; Classic inquiry is a separate ESP32 capability and is not silently substituted for BLE results.
-
 ## Phase: Journal-Based RSSI Window Location Evidence
 
 Changed:
@@ -638,12 +596,6 @@ Validation:
 - `node --check dashboard/app.js` passed.
 - Runtime database remains clean: observations, identities, logical devices, location estimates, events, heartbeats, and processing errors are all zero.
 - No backend server or serial bridge was started in this phase, so no process was left running.
-
-Limits:
-
-- The cited method supports relative RSSI change and proximity-evidence reliability; it does not turn one ESP32's RSSI into universal meters or exact indoor coordinates.
-- The `beta=0.85`, five-reading window, and `0.6` movement threshold are the cited paper's experimental algorithm values, not universal physical constants. They are internal and auditable, not operator calibration settings.
-- A one-scanner result identifies the scanner installation context only. Exact device coordinates require multiple fixed scanners and a separately measured environmental model or fingerprint dataset.
 
 ## Phase: Journal Radial Distance And ESP32 Batch Reliability
 
@@ -666,12 +618,6 @@ Validation:
 - Controlled real ESP32 verification on port `8020`: heartbeat/configuration returned HTTP 200; repeated batches of 40 returned HTTP 200 with payloads around 29 KB; no JSON truncation or batch 422 occurred after firmware `1.2.1` and the 60-second timeout.
 - API output contained non-null modeled distances and scanner-centre coordinates, with examples correctly marked `outside_published_baseline_range` when RSSI implied a distance beyond the paper's validated range.
 - The temporary server and serial bridge were stopped after verification. No process remains listening on port `8020`.
-
-Limits:
-
-- The distance is a radial model estimate. It is not a measured distance and does not provide direction or an exact indoor coordinate with one scanner.
-- The ELKHA paper reports its useful accuracy only in a limited clear-line-of-sight range; weak observations such as `-90 dBm` can produce very large modeled radii and are explicitly marked outside that validation range.
-- The existing runtime observations from the verification are real ESP32 data and were not deleted in this phase.
 
 ## Phase: USB Large-Frame Integrity And Runtime Shutdown Reliability
 
@@ -723,12 +669,6 @@ Validation:
 - Final database verification reports zero rows for observations, observed identities, logical devices, events, location estimates, heartbeats, and processing errors. Scanner `scn_dev_lab_001` remains registered at `-6.26085, 106.960005` with desired configuration version `3` and `rssi_min=-85`.
 - No backend or serial bridge process was left listening on port `8000`.
 
-Limits:
-
-- The capture floor reduces very weak ambient reception; it cannot reveal the exact number of physical devices behind rotating BLE private addresses.
-- Bluetooth private addresses can rotate periodically. Generic name, manufacturer namespace, or payload-layout similarity is insufficient for an automatic physical-device merge, so uncertain identities remain separate and auditable.
-- The ESP32 brownout is a power-integrity failure at boot. It must be resolved with a stable USB port/cable or powered supply before the latest firmware can complete an end-to-end runtime check; disabling the detector would hide a hardware fault and risk corrupted operation.
-
 ## Phase: macOS USB Disconnect Diagnosis
 
 Investigated:
@@ -765,11 +705,6 @@ Validation:
 - Shutdown was tested with eight active dashboard SSE connections. A single `Ctrl+C` completed application shutdown in under one second with exit code `0`; no runner, serial bridge, port listener, or serial-port owner remained.
 - `python3 -m pytest -q` passed: 43 tests.
 - `PYTHONPYCACHEPREFIX=/tmp/bluetooth-scanner-pycache python3 -m compileall -q backend run.py serial_bridge.py tests` passed.
-
-Notes:
-
-- The 69 observations from this phase are real post-recovery ESP32 captures and were intentionally retained. No simulator or generated observation was used.
-- The server used for verification was stopped. The next normal start remains `python3 run.py` by the operator.
 
 ## Phase: ESP32 Device-Name Enrichment Feasibility Review
 
@@ -817,12 +752,6 @@ Validation:
 - The final database check reported zero processing errors and zero repeated expired self-transition events.
 - The verification runner was stopped cleanly. Port `8000` has no listener and `/dev/cu.usbserial-0001` has no process owner.
 
-Limits:
-
-- GATT enrichment cannot name a non-connectable advertisement, a characteristic that requires authorization, or a device that omits standard identity characteristics. Non-connectable Apple/Find My traffic therefore remains an address/protocol observation unless direct bytes provide another factual label.
-- A GATT Device Name, manufacturer, and model improve display information but are not automatically treated as a unique cross-address identity. Only stronger evidence such as serial/System ID, accepted correlation, or operator confirmation makes randomized-address presence durable.
-- The current firmware remains BLE-only. Bluetooth Classic inquiry/Remote Name/SDP for Classic-only TWS devices requires a separate Bluedroid firmware phase and was not mixed into this BLE stability change.
-
 ## Phase: Durable Device Anchors And Map Interaction Cleanup
 
 Changed:
@@ -847,12 +776,6 @@ Validation:
 - Migration `0004 -> 0005` completed successfully on the active SQLite database; no observation or identity rows were deleted.
 - Dashboard assets and live API endpoints returned HTTP 200 during the temporary backend check. Interactive browser verification was stopped at the operator's request and is not claimed as complete.
 - The temporary backend ran with the serial bridge disabled, so no test or generated Bluetooth observation entered the database. It was stopped cleanly and port `8020` has no listener.
-
-Limits:
-
-- A single movable scanner cannot factually distinguish scanner movement from Bluetooth-device movement. Therefore the same scanner ID never relocates an existing device anchor automatically.
-- A factual cross-location move requires a newer observation from a different fixed scanner identity, or a future explicit operator relocation workflow.
-- The stored point is a scanner-location snapshot, not an exact Bluetooth-device coordinate. RSSI still provides only a radial signal model with no bearing from one scanner.
 
 ## Phase: Reproducible Setup And Engineering Documentation
 
@@ -887,12 +810,6 @@ Validation:
 - Source audit found no simulator, dummy-data, fake-data, or generated-observation path in the runtime, setup, backend, firmware, dashboard, or environment template.
 - Port 8000 had no listener after validation. The backend server was not started and no runtime process was left active.
 
-Limits:
-
-- Firmware upload was not executed because no ESP32 serial port was connected during final validation. The build and automatic `flash` target are ready; upload requires the physical board and an unused serial port.
-- All Markdown files are intentionally ignored at the user's request. Existing tracked Markdown in a future or external Git repository would require a separate index removal because `.gitignore` does not untrack files.
-- Retention settings remain configuration only until a bounded archival/cleanup worker is implemented and tested.
-
 ## Phase: Backend Documentation And Test Console Scope
 
 Changed:
@@ -916,11 +833,6 @@ Validation:
 - Python `compileall` passed for backend, runner, bridge, setup, and tests.
 - `node --check dashboard/app.js` passed.
 - Port 8000 had no listener. No backend or serial process was started for this phase.
-
-Limits:
-
-- The backend still provides `/api/settings` as an engineering API for existing internal policy records. It is no longer exposed by the test console.
-- Repository eligibility is configured, but files cannot be staged or committed until this directory is initialized as a Git repository or connected to its intended repository metadata.
 
 ## Phase: Reference Material Exclusion
 
@@ -953,11 +865,6 @@ Validation:
 - Focused backend, realtime, serial bridge, and existing processing tests passed: 49 tests.
 - Regression coverage proves a session requires a real BLE observation, an unrelated address is rejected, duplicate samples are idempotent, Walk positions do not patch scanner installation coordinates, and focus samples do not alter device presence or location state.
 
-Limits:
-
-- Normal ESP32 scan cadence remains unchanged in this phase. Responsive focus telemetry is implemented in the following firmware phase.
-- The test console does not consume the new tracking APIs until the dashboard phase is complete.
-
 ## Phase: ESP32 Focused Signal Acquisition
 
 Changed:
@@ -976,11 +883,6 @@ Validation:
 - PlatformIO compiled the release firmware successfully for `esp32dev`.
 - Final firmware usage is 115,020 bytes of RAM (35.1%) and 637,741 bytes of the application flash partition (48.7%).
 - Rebuilt after replacing the race-prone ring-buffer ACK path with a separate immutable in-flight batch.
-
-Limits:
-
-- This phase validates the firmware binary, not RF performance in a controlled measurement environment.
-- Focus samples report measured RSSI at the scanner. The ESP32-D0WD-V3 has no GPS or Bluetooth direction-finding hardware and therefore cannot directly report a target bearing or exact coordinate.
 
 ## Phase: Signal Finder Test Console And Runtime Concurrency
 
@@ -1008,12 +910,6 @@ Validation:
 - All backend and browser tests used a copy of the real database. No generated Bluetooth observation or simulated scanner payload was submitted.
 - The temporary backend and browser were stopped after validation.
 
-Limits:
-
-- The signal meter and tone represent measured RSSI strength and trend, not direction. Moving toward a stronger measurement is an operator-guided search method; it does not make the ESP32 a bearing sensor.
-- A Fixed session can only place the measurement at the scanner's configured location. A Walk session can map where measurements were taken, but the strongest point is still not proof of the Bluetooth device's exact coordinate.
-- Focus tracking accepts only identities already associated with the selected logical device. It does not merge a new randomized address based on RSSI, name, or proximity alone.
-
 ## Phase: Focused Tracking Engineering Documentation
 
 Changed:
@@ -1033,10 +929,6 @@ Validation:
 - Searched maintained documentation for stale firmware `1.3.1`, single-connection SQLite descriptions, and obsolete blanket retention statements; none remain.
 - `git diff --check` completed without whitespace errors.
 - The documentation consistently identifies `dashboard/` as a non-production backend test console and keeps backend state and API contracts authoritative.
-
-Limits:
-
-- Documentation describes implemented firmware and backend behavior only. It does not claim that browser GPS comes from the ESP32 or that Signal Finder measures target direction.
 
 ## Phase: Real-Hardware Tracking And GATT Reliability
 
@@ -1066,12 +958,6 @@ Validation:
 - No generated Bluetooth observations, simulated scanners, dummy devices, or placeholder measurements were used.
 - The backend and serial bridge were stopped after acceptance. Port 8000 has no listener and no process owns the CP2102 serial port.
 
-Limits:
-
-- The installed ESP32-D0WD-V3 has no GPS and no Bluetooth direction-finding/AoA hardware. One scanner measures signal at its configured anchor; it cannot produce a factual target bearing or exact indoor coordinate.
-- GATT enrichment depends on a device being connectable and exposing readable characteristics. It cannot bypass encryption, pairing, authorization, or a device that stops advertising.
-- The six-second freshness bound is a measured limit for the current USB serial path. A future network transport or different hardware should be measured independently before changing it.
-
 ## Phase: Browser Geolocation Error Handling
 
 Changed:
@@ -1091,11 +977,6 @@ Validation:
 - All 69 backend and integration tests passed.
 - `git diff --check` completed without whitespace errors.
 - No backend, serial bridge, simulator, or test-data generator was started.
-
-Limits:
-
-- Browser fallback can only return a position supplied by the operating system. It does not make the Mac or ESP32 a GPS receiver and does not create coordinates when Location Services is unavailable.
-- Plain HTTP geolocation remains unavailable from non-local origins by browser policy; deployment through a LAN address requires HTTPS.
 
 ## Phase: Continuous Scanner Position And Observation Anchors
 
@@ -1121,12 +1002,6 @@ Validation:
 - No backend, serial bridge, simulator, or generated Bluetooth-data process was started for this phase.
 - The pre-existing backend and orphaned serial bridge were stopped; port 8000, the runner lock, and `/dev/cu.usbserial-0001` were free at completion.
 
-Limits:
-
-- Browser location describes the Mac or other browser device. It is valid scanner-position evidence only while that device remains physically co-located with the cable-connected ESP32.
-- A persistent watcher cannot force macOS Location Services to produce a fix. Permission denial, disabled Location Services, unavailable Wi-Fi positioning, or a non-secure remote origin still prevent updates.
-- A device marker is the scanner position captured when that BLE advertisement was observed. One ESP32 still cannot derive the Bluetooth transmitter's exact coordinate or direction from RSSI.
-
 ## Phase: Trusted Local HTTPS And Browser Location Diagnostics
 
 Changed:
@@ -1146,12 +1021,6 @@ Validation:
 - The scanner position endpoint accepted repeated browser fixes with HTTP 200.
 - No generated Bluetooth observations, simulated scanner, or placeholder position was used.
 
-Limits:
-
-- HTTP and HTTPS are different browser origins and maintain separate Safari location permissions.
-- A Mac location fix normally depends on macOS Location Services and nearby Wi-Fi positioning; HTTPS does not create GPS hardware.
-- Browser diagnostics are process-local troubleshooting state and intentionally do not persist coordinates.
-
 ## Phase: Stable Operator-Controlled Map Viewport
 
 Changed:
@@ -1169,11 +1038,6 @@ Validation:
 - Dashboard JavaScript syntax validation and Python bytecode compilation passed.
 - `git diff --check` passed for the changed dashboard and test files.
 - The existing user-started runner was not restarted or stopped during this phase.
-
-Limits:
-
-- Leaflet may still pan enough to keep an opened popup visible; it will not zoom out as part of live data refresh.
-- Visual browser automation was not run because Playwright is not installed in the project environment. The camera transition logic is covered by source-level regression tests.
 
 ## Phase: Bounded USB Requests And Accurate Live Counts
 
@@ -1196,12 +1060,6 @@ Validation:
 - PlatformIO built firmware `1.4.2` successfully at 35.2% RAM and 49.4% flash usage.
 - No simulated scanner, generated Bluetooth observation, placeholder coordinate, or fake device record was introduced.
 - The user-started runner and attached ESP32 were not stopped, restarted, or flashed during this phase.
-
-Limits:
-
-- The exact request whose acknowledgement was lost is not persisted in the database; the observed 66-second transport stall identifies the failure class but not that individual request.
-- The running ESP32 continues to use its previously flashed firmware until firmware `1.4.2` is flashed and the runner is restarted.
-- `present_ble_records` counts current logical BLE records, not guaranteed unique physical devices; unresolved rotating identities remain explicitly separated.
 
 ## Phase: Continuous RF Capture, Independent Transport, And Apple Evidence
 
@@ -1229,13 +1087,6 @@ Validation:
 - `git diff --check` completed without whitespace errors.
 - No backend or serial-bridge process was started or stopped, and the attached ESP32 was not flashed.
 
-Limits:
-
-- A valid BLE packet is factual radio evidence, but it does not prove that each observed address belongs to a different physical device. Address rotation, relaying, spoofing, and repeated Apple Continuity broadcasts cannot be resolved from RSSI alone.
-- The default dashboard filter reduces rotating-address noise; it does not delete weak raw observations or claim that hidden broadcasts are fake.
-- Apple transition evidence can support an operator decision, but it cannot establish a permanent physical identity when the protocol exposes no stable identifier.
-- Firmware `1.5.0` behavior begins only after an explicit device flash. The next normal `run.py` startup applies database revision `0009`; neither operation was forced during this phase.
-
 ## Phase: Supervised Continuous Scan And Bounded GATT Enrichment
 
 Changed:
@@ -1255,12 +1106,6 @@ Validation:
 - Five focused firmware-contract, backend-enrichment, heartbeat-provenance, and setup tests passed.
 - The user-started backend and serial bridge were not stopped or restarted, and the ESP32 was not flashed.
 
-Limits:
-
-- General scanning pauses only for admitted GATT work because the installed ESP32 shares one BLE radio between discovery and connection procedures.
-- GATT remains opportunistic: many devices reject connections, require security, omit Device Information characteristics, or stop advertising before a connection is established.
-- Radio-silence recovery restarts the scan controller; reset reason and heap telemetry are still required to distinguish controller stalls from board resets or power faults during a hardware soak test.
-
 ## Phase: Time-Window Signal Filtering And Adaptive Tracking Freshness
 
 Changed:
@@ -1276,11 +1121,6 @@ Validation:
 
 - All 14 tracking tests passed.
 - No operational tracking records, Bluetooth observations, scanner state, or running process were modified during validation.
-
-Limits:
-
-- Adaptive freshness determines when recent evidence is no longer live; it cannot make a device advertise while connected, sleeping, powered off, or outside radio coverage.
-- RSSI remains a noisy proximity signal. Median filtering reduces short multipath spikes but does not provide direction or an exact indoor coordinate from one scanner.
 
 ## Phase: Tracking Stream Recovery And Capture-Time UI Freshness
 
@@ -1299,11 +1139,6 @@ Validation:
 - `node --check dashboard/app.js` completed successfully.
 - The active dashboard server was not restarted; validation used static source and automated tests only.
 
-Limits:
-
-- SSE remains best-effort transport rather than a durable event log. Rehydration recovers persisted tracking samples and positions after a gap, but an event that was never committed cannot be reconstructed.
-- Browser and server clocks must remain reasonably synchronized; the backend continues to mark materially delayed capture timestamps rather than presenting them as live.
-
 ## Phase: Cross-Layer Contracts And Release Verification
 
 Changed:
@@ -1320,11 +1155,6 @@ Validation:
 - Python bytecode compilation, dashboard JavaScript syntax validation, and `git diff --check` passed.
 - No migration was required because reset reason and enrichment storage use existing normalized database columns and tables.
 
-Limits:
-
-- Source verification cannot establish long-term radio stability. Heap plateau, scan callback continuity, restart reason, heartbeat cadence, and observation delivery must be measured after firmware `1.6.0` is flashed.
-- The existing user-started runner and its attached ESP32 were deliberately left untouched during build and test validation.
-
 ## Phase: Hardware Activation Gate And Runtime Baseline
 
 Changed:
@@ -1338,11 +1168,6 @@ Validation:
 - The release firmware artifact was produced successfully at `firmware/.pio/build/esp32dev/firmware.bin`.
 - Read-only runtime inspection showed the attached scanner still reporting firmware `1.4.1`; therefore no `1.6.0` hardware-soak result is claimed.
 - The active runtime showed repeated boot identities and declining free-heap samples under the old firmware, confirming that deployment and a fresh telemetry baseline are required before accepting the radio-stability fix.
-
-Limits:
-
-- Flashing requires exclusive access to the ESP32 serial port and must be coordinated with the currently user-owned runner.
-- No scanner reboot, firmware flash, server restart, fake observation, or operational database mutation was performed in this phase.
 
 ## Phase: Sustained USB Ingestion And Boot-Safe Enrichment
 
@@ -1374,14 +1199,6 @@ Rejected intermediate configurations:
 - Runtime baud `460800` had adequate nominal throughput but produced malformed and corrupted frames during sustained transfer, so it is not the release configuration.
 - A first high-speed flash attempt lost the CP2102 transfer before final completion. The board was reflashed at the configured lower upload speed and accepted only after it reported the expected release through a real heartbeat.
 
-Limits:
-
-- This was a five-minute hardware acceptance, not the documented one-hour soak. Free heap remained above 56 KB at the final heartbeat with a 51 KB recorded minimum, but long-term heap plateau and USB stability still require the one-hour gate.
-- Two firmware ACK timeouts were counted: one before the bridge was ready and one transient timeout during the run. Retry recovery completed with zero dropped observations and zero transport failures; deployments must continue monitoring these counters.
-- The RAM queue is bounded and volatile. It handles temporary acknowledgement gaps but does not survive scanner power loss and is not durable offline storage.
-- GATT enrichment remains opportunistic and does not force pairing. A successful read enriches only the exact source observation; it does not establish a permanent identity for rotating private addresses.
-- One stationary ESP32 provides factual scanner-anchor and RSSI evidence, not an exact transmitter coordinate or left/right direction.
-
 ## Phase: Louder DF-Style Signal Finder Audio
 
 Changed:
@@ -1399,7 +1216,144 @@ Validation:
 - Dashboard JavaScript syntax validation, Python bytecode compilation, and `git diff --check` passed.
 - No backend, serial bridge, ESP32 firmware, database record, scanner configuration, or Bluetooth observation was changed during this phase.
 
-Limits:
+## Phase: Canonical Runtime Configuration And Bounded Retention
 
-- Safari still requires a user gesture before Web Audio can start. The existing Track Signal or Sound action supplies that gesture, but browser or operating-system output volume can still mute the result.
-- Tone loudness represents normalized RSSI proximity evidence only. It does not indicate direction, exact distance, or an exact device coordinate from one scanner.
+Changed:
+
+- Made environment-backed server settings the single source of truth for heartbeat, presence, and retention thresholds. Duplicate values in `system_settings` are removed during setup instead of silently overriding runtime behavior.
+- Removed presence thresholds and the unused `extra` object from scanner configuration responses because firmware never consumed them. Scan interval, upload interval, batch size, RSSI admission, version, and tracking focus remain unchanged.
+- Added semantic validation for runtime thresholds, including ordered presence windows and ordered raw/summary retention periods.
+- Restricted the dynamic settings endpoint to supported correlation controls and added type/range validation. Unknown setting keys can no longer create disconnected configuration records.
+- Replaced tracking-only cleanup with bounded retention across raw observations, location estimates, scanner heartbeats, tracking samples and positions, GATT enrichments, events, processing errors, and completed tracking sessions.
+- Preserved current scanner/device state, observed identities, logical devices, identity-correlation records, and manual decisions during retention cleanup.
+- Removed the unused per-scanner processing-settings adapter and stopped loading scanner configuration for every observation batch when none of its values participate in server-side observation processing.
+
+Validation:
+
+- Added retention and configuration contract coverage, including stale-history cleanup, current-state preservation, scanner payload shape, duplicate-setting removal, and invalid-setting rejection.
+- All 63 targeted processing, tracking, and retention tests passed.
+- Python bytecode compilation and `git diff --check` passed.
+- No operational database, running scanner process, serial device, or firmware was changed during this phase.
+
+## Phase: Stable Derived State And Low-Noise Device Lifecycle
+
+Changed:
+
+- Kept every accepted BLE observation as raw evidence while changing `DeviceLocationEstimate` into meaningful derived history. A row is now written only for the first observation, a factual scanner-anchor change, or a hysteresis-confirmed signal-band change.
+- Kept current proximity output fresh by serializing the latest observation model even when no new location-history row is needed.
+- Added a fixed 2 dB RSSI-band hysteresis margin so samples near a band boundary do not repeatedly switch labels.
+- Added separate movement entry and exit thresholds around the published RSSI-window metric, plus a two-evaluation dwell requirement. Candidate and applied states are preserved in each observation's processing evidence.
+- Renamed RSSI-only band events from `device_location_estimate_changed` to `device_signal_band_changed`; a one-scanner RSSI change is no longer presented as a physical location change.
+- Replaced minute-bucket deduplication for location, movement, and signal transitions with observation-scoped keys so two real transitions in the same minute are not accidentally discarded.
+- Reduced unresolved randomized-address lifecycle noise. A new unresolved random identity does not emit a durable device-discovered event, expires directly after the missing threshold, emits one `device_identity_expired` event, and does not generate missing/offline/return/movement/band event chains unless stronger identity evidence later exists.
+- Refined anchor updates so repeated observations at an unchanged scanner position do not rewrite location history. A newer observation from a different scanner, changed scanner zone, or changed current scanner position still updates the factual anchor; delayed observations still cannot move it backward.
+
+Validation:
+
+- Added tests for signal-band hysteresis, movement entry/exit thresholds, movement dwell, raw-versus-derived history, low-noise randomized identity expiry, and same-minute transition preservation.
+- Updated multi-scanner location-history expectations to exclude a delayed observation that did not alter current state.
+- All 68 targeted processing, tracking, and retention tests passed.
+- Python bytecode compilation and `git diff --check` passed.
+- No operational database, scanner process, serial connection, or firmware was changed during this phase.
+
+## Phase: Canonical Device Correlation And Operator Review
+
+Changed:
+
+- Added one canonical logical-device merge path used by automatic evidence-based carryover, direct operator merge, and accepted identity proposals.
+- Canonical merge now reassigns observations, location estimates, device events, GATT enrichments, and tracking sessions; preserves aliases, notes, tags, known state, and first/last-seen state; and clears the retired record's map anchor to prevent duplicate markers.
+- Implemented evidence-based split for a specific observed identity. Split moves attributable observations, exact observation-time location estimates, identity-linked events, and enrichments, then rebuilds both logical-device states from their remaining raw evidence.
+- Added an observation-time anchor snapshot to processing notes so a later split reconstructs historical location from capture-time evidence rather than the scanner's current position.
+- Added validated device metadata editing for alias, notes, tags, and known-device status, including an auditable metadata-update event.
+- Added explicit accept/reject review for identity-correlation proposals. Accepted proposals use the canonical merge path; rejected proposals remain separate; both decisions are stored with the correlation ID.
+- Removed statistical auto-accept settings and code. Akiyama RSSI-time assignments and Apple Continuity transitions are always proposals; only an operator decision or an approved protocol-specific static token can merge records.
+- Required an approved AD token to meet the configured observation minimum on both predecessor and successor identities before automatic carryover.
+- Enabled production RSSI-time proposal evaluation only for randomized successor identities with enough samples. Candidate identities and observations are bounded by the configured evidence window and loaded in bulk, avoiding a 500-query correlation pass on every batch.
+- Added native dashboard controls for metadata editing, direct merge, per-identity split, and proposal accept/reject. Relationship-changing actions require confirmation.
+- Stopped ignore/unignore from overwriting valid underlying presence state. Legacy records whose status was already overwritten are reconstructed from last-seen time when unignored.
+
+Validation:
+
+- Added merge coverage across every device-owned relation, split reconstruction coverage, proposal accept/reject coverage, metadata audit coverage, and dashboard workflow contract tests.
+- All 125 automated tests passed.
+- Dashboard JavaScript syntax validation, Python bytecode compilation, and `git diff --check` passed.
+- No operational database, running scanner, serial connection, or firmware was changed during this phase.
+
+## Phase: Single GATT Enrichment Transport
+
+Changed:
+
+- Removed GATT enrichment from the raw BLE observation schema. Observation batches now contain advertisement evidence only and reject an inline `gatt_enrichment` object instead of supporting two competing ingestion paths.
+- Kept the dedicated scanner enrichment endpoint as the only GATT write path. Each report remains idempotently bound to its scanner and original boot-scoped source observation ID before it can update device metadata.
+- Removed the redundant GATT object from observation processing notes and recent-observation serialization. Device details continue to expose GATT evidence from the normalized enrichment record.
+- Split firmware radio observations and GATT worker output into `Observation` and `GattEnrichmentResult`. The 96-item radio queue no longer reserves thirteen strings and GATT state for every scan result.
+- Removed the unreachable inline GATT serializer from normal observation batches. Separate GATT upload, retry, expiry, health counters, worker timeout, and non-pairing reads remain unchanged.
+- Released the source configuration as `esp32-ble-scanner-1.7.0` so deployed firmware can be distinguished from the previous dual-path structure.
+
+Validation:
+
+- All 76 processing, serial-bridge, and setup tests passed, including inline-schema rejection, separate-report idempotency, source-observation validation, and normalized device-detail output.
+- PlatformIO built firmware `1.7.0` successfully with NimBLE-Arduino 2.5.0. The image uses 70,724 bytes of RAM (21.6%) and 654,717 bytes of flash (50.0%).
+- Python bytecode compilation and `git diff --check` passed.
+- No server, operational database, serial connection, or scanner process was started. The connected ESP32 was not flashed.
+
+## Phase: Deterministic Schema And Runtime Cleanup
+
+Changed:
+
+- Replaced the initial migration's import of the current SQLAlchemy `Base` with explicit Alembic table and index operations. A fresh installation now produces the same historical baseline regardless of later model changes.
+- Added migration `0011` for the current cleanup. It links manual proposal decisions to their exact correlation record, removes legacy per-scanner presence/extra configuration, removes write-only identity hash/signature columns, and removes the duplicate monitored-location table.
+- Preserved legacy scanner-location data during migration by copying missing building, floor, room, zone, outdoor coordinates, and indoor coordinates onto the owning scanner before the duplicate table is removed.
+- Made the scanner row the single source of scanner installation and position metadata. Multi-scanner latitude, longitude, indoor coordinates, orientation, browser-position provenance, and position history remain supported.
+- Removed `Base.metadata.create_all()` from runner startup. `run.py` now applies Alembic migrations and then seeds the configured local scanner; it cannot silently create an unmigrated partial schema.
+- Removed identity fingerprint/signature generation that was written on every observation but never read by correlation. Correlation continues to use raw observations, parsed AD evidence, GATT records, time continuity, RSSI continuity, scanner anchors, and explicit operator decisions.
+- Removed the unused signal-band confidence helper and unused firmware HTTP timeout constant.
+- Consolidated raw serial inspection into `diagnose_esp32.py` at the release baud of 230400. Removed the duplicate serial reader, the hardcoded CP2102 probe, and the disconnected Core Location Swift helper.
+
+Validation:
+
+- Added isolated migration tests for a fresh database and an upgrade from revision `0010` containing legacy scanner, location, observed-identity, and logical-device rows.
+- Alembic schema comparison reports no pending model operations after a fresh upgrade to `0011`.
+- All 127 automated tests passed. Dashboard JavaScript syntax validation, Python bytecode compilation, and `git diff --check` also passed.
+- Migration tests used temporary SQLite files only. The operational database, server, scanner process, serial port, and ESP32 were not touched.
+
+## Phase: Documentation Contract And Final Verification
+
+Changed:
+
+- Synchronized the maintained backend documentation with the implemented `1.7.0` protocol, including the dedicated GATT enrichment transport, scanner configuration shape, canonical device ownership, proposal review, bounded retention, and Alembic-only startup.
+- Documented that RSSI-time and Apple Continuity correlation always produce review proposals. Removed the stale instruction for statistical auto-accept; approved protocol-specific static-token carryover remains the only automatic identity merge path.
+- Documented canonical merge and evidence-based split behavior, including attributable-history movement, current-state reconstruction, raw-address preservation, exact proposal binding, and operator audit records.
+- Updated the engineering function catalog for canonical record operations and operator-owned metadata updates.
+- Updated operations, privacy, testing, project-structure, and README references for the current baud, firmware version, retained utilities, history cleanup, migration policy, and normalized GATT data model.
+
+Validation:
+
+- All 127 automated tests passed, including fresh-install migration, representative `0010` to `0011` upgrade, schema-drift, retention, correlation, processing, tracking, bridge, and dashboard contract coverage.
+- Python bytecode compilation, dashboard JavaScript syntax validation, documentation stale-contract search, runtime simulator/fake-data search, and `git diff --check` passed.
+- PlatformIO built firmware `1.7.0` successfully with 70,724 bytes of RAM (21.6%) and 654,717 bytes of flash (50.0%).
+- No server, operational database, serial port, scanner process, or browser was started. The ESP32 was not flashed.
+
+## Phase: Official Flipper Zero Classification And Repository Scope
+
+Changed:
+
+- Added a backend classifier for the official Flipper Zero serial-profile UUIDs `0x3081`, `0x3082`, and `0x3083`, including black, white, and transparent hardware-variant mapping.
+- Required verified raw AD parsing for passive classification. Generic HID, Nordic UART, device names, and address prefixes remain supporting evidence and cannot independently produce the label.
+- Added an active GATT classification path requiring both `Flipper Devices Inc.` and the official Flipper serial service UUID.
+- Added `Confirmed Flipper Zero`, profile, variant, rule ID, verification scope, spoofability, and structured evidence to device-list, device-detail, and observed-identity API responses.
+- Stored the classification in processing evidence for new matching observations while deriving it from retained latest evidence so existing records do not require a database backfill.
+- Added the product label to device search, the live-device table, device detail, observed identities, and map device popups without changing identity correlation, presence, movement, tracking, or location-anchor behavior.
+- Updated `README.md` with the classification contract and repository scope.
+- Removed every historical `Limits:` and `Notes:` block from this changelog; phase entries now contain changes and validation only.
+- Ignored and removed `docs/` and the local `df-bluetooth/` reference from Git tracking while preserving both directories in the local workspace.
+- Removed the standalone `diagnose_esp32.py` utility. The tracked Python surface now consists of backend modules, migrations, `setup_project.py`, `run.py`, the required serial bridge, and automated tests.
+
+Validation:
+
+- Added positive coverage for the captured `Okikitg` raw advertisement, all three official classification fields, active GATT evidence, unverified UUID rejection, and generic HID rejection.
+- Added dashboard contract coverage for table, detail, observed-identity, search, map-popup, and classification badge rendering.
+- All 131 automated tests passed.
+- Dashboard JavaScript syntax validation, Python bytecode compilation, and `git diff --check` passed.
+- A read-only copy of the operational database classified `Okikitg` as `Confirmed Flipper Zero`, variant `white`, profile `serial_rpc`, from verified UUID `0x3082` and its corroborating ADV history.
+- No server, operational database write, scanner process, serial connection, firmware change, or ESP32 flash was performed.

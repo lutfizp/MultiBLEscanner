@@ -1,12 +1,11 @@
-# Keep repository documentation in Git, except historical requirement phases
+# Keep only repository entry-point documentation in Git
 *.md
 !/README.md
 !/CHANGELOG.md
-!/docs/*.md
 
-# Historical requirement documents remain local
-/docs/phase-1-requirement-analysis.md
-/docs/phase-2-technical-design.md
+# Local engineering documentation and research projects
+/docs/
+/df-bluetooth/
 
 # Research papers and third-party comparison projects
 /references/

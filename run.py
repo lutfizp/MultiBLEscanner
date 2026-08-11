@@ -68,14 +68,11 @@ def bootstrap_database() -> dict[str, object]:
     from alembic import command
     from alembic.config import Config
 
-    from backend.app import models  # noqa: F401
-    from backend.app.database import Base, engine
     from backend.app.seed import ensure_local_scanner
 
     alembic_config = Config(str(ROOT / "backend" / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(ROOT / "backend" / "migrations"))
     command.upgrade(alembic_config, "head")
-    Base.metadata.create_all(bind=engine)
     return ensure_local_scanner()
 
 

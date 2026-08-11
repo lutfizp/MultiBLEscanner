@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 from dataclasses import dataclass
@@ -70,6 +69,10 @@ SIGNAL_BAND_THRESHOLDS: tuple[tuple[str, int], ...] = (
 RSSI_WINDOW_SIZE = 5
 RSSI_WEIGHT_BASE = 0.85
 RSSI_MOVEMENT_THRESHOLD = 0.6
+RSSI_MOVEMENT_ENTER_THRESHOLD = 0.65
+RSSI_MOVEMENT_EXIT_THRESHOLD = 0.45
+RSSI_MOVEMENT_DWELL_OBSERVATIONS = 2
+SIGNAL_BAND_HYSTERESIS_DB = 2.0
 
 # ESP32 BLE indoor asset-tracking baseline reported by Al-Maktary et al.
 # (ELKHA, 2025): A is the measured RSSI at 1 m and n is the path-loss
@@ -149,13 +152,77 @@ def signal_band_from_rssi(rssi: int | float | None) -> str:
     return "signal_very_weak"
 
 
-def signal_band_confidence(rssi: int | float | None) -> float:
-    """Return classification margin, not physical-location confidence."""
-    if rssi is None:
-        return 0.0
+def signal_band_with_hysteresis(
+    rssi: int | float | None,
+    previous_band: str | None,
+) -> str:
+    """Hold a signal band near a threshold to avoid boundary chatter."""
+    raw_band = signal_band_from_rssi(rssi)
+    if rssi is None or previous_band not in {
+        "signal_strong",
+        "signal_moderate",
+        "signal_weak",
+        "signal_very_weak",
+    }:
+        return raw_band
+
     value = float(rssi)
-    nearest_boundary = min(abs(value - threshold) for _, threshold in SIGNAL_BAND_THRESHOLDS)
-    return round(min(0.95, 0.55 + (nearest_boundary / 20.0)), 2)
+    if previous_band == "signal_strong":
+        return "signal_moderate" if value < -60 - SIGNAL_BAND_HYSTERESIS_DB else previous_band
+    if previous_band == "signal_moderate":
+        if value >= -60 + SIGNAL_BAND_HYSTERESIS_DB:
+            return "signal_strong"
+        if value < -75 - SIGNAL_BAND_HYSTERESIS_DB:
+            return "signal_weak"
+        return previous_band
+    if previous_band == "signal_weak":
+        if value >= -75 + SIGNAL_BAND_HYSTERESIS_DB:
+            return "signal_moderate"
+        if value < -88 - SIGNAL_BAND_HYSTERESIS_DB:
+            return "signal_very_weak"
+        return previous_band
+    return "signal_weak" if value >= -88 + SIGNAL_BAND_HYSTERESIS_DB else previous_band
+
+
+def movement_result_from_metrics(
+    metrics: RSSIWindowMetrics,
+    previous_status: str | None,
+) -> MovementResult:
+    """Apply entry/exit hysteresis to the published RSSI change metric."""
+    if metrics.rssi_metric is None:
+        return MovementResult(previous_status or "stationary", 0.0, "rssi_window_not_ready")
+
+    moving_before = previous_status == "probably_moving"
+    if moving_before:
+        if metrics.rssi_metric <= RSSI_MOVEMENT_EXIT_THRESHOLD:
+            return MovementResult(
+                "signal_stable",
+                round(metrics.reliability or 0.0, 2),
+                "paper_rssi_metric_below_exit_threshold",
+            )
+        return MovementResult(
+            "probably_moving",
+            round(metrics.rssi_metric, 2),
+            "movement_hysteresis_held",
+        )
+
+    if metrics.rssi_metric >= RSSI_MOVEMENT_ENTER_THRESHOLD:
+        return MovementResult(
+            "probably_moving",
+            round(metrics.rssi_metric, 2),
+            "paper_rssi_metric_above_entry_threshold",
+        )
+    if metrics.rssi_metric <= RSSI_MOVEMENT_EXIT_THRESHOLD:
+        return MovementResult(
+            "signal_stable",
+            round(metrics.reliability or 0.0, 2),
+            "paper_rssi_metric_below_exit_threshold",
+        )
+    return MovementResult(
+        previous_status or "stationary",
+        round(metrics.reliability or 0.0, 2),
+        "movement_hysteresis_held",
+    )
 
 
 def infer_proximity_from_rssi(
@@ -297,32 +364,3 @@ def observed_again_status(previous_status: str | None) -> tuple[str, str] | None
     if previous_status in {None, "unknown"}:
         return "newly_detected", "first_logical_observation"
     return None
-
-
-def identity_signature(
-    name: str | None,
-    service_uuids: list[str] | None,
-    manufacturer_data: str | None,
-    service_data: dict[str, Any] | None = None,
-    appearance: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "name": (name or "").strip().lower() or None,
-        "service_uuids": sorted({item.lower() for item in service_uuids or [] if item}),
-        "manufacturer_data_prefix": (manufacturer_data or "")[:8].lower() or None,
-        "service_data_keys": sorted((service_data or {}).keys()),
-        "appearance": appearance,
-    }
-
-
-def identity_fingerprint(signature: dict[str, Any]) -> str:
-    stable = "|".join(
-        [
-            str(signature.get("name") or ""),
-            ",".join(signature.get("service_uuids") or []),
-            str(signature.get("manufacturer_data_prefix") or ""),
-            ",".join(signature.get("service_data_keys") or []),
-            str(signature.get("appearance") or ""),
-        ]
-    )
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()

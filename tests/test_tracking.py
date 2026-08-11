@@ -64,7 +64,6 @@ def seed_tracking_device(db, *, with_observation: bool = True):
         first_seen_at=now,
         last_seen_at=now,
         observation_count=1 if with_observation else 0,
-        identity_signature={},
     )
     db.add_all([scanner, device])
     db.flush()
@@ -74,7 +73,6 @@ def seed_tracking_device(db, *, with_observation: bool = True):
         address="aa:bb:cc:dd:ee:01",
         address_type="public",
         randomized_address=False,
-        fingerprint="tracking-fingerprint",
         first_seen_at=now,
         last_seen_at=now,
         observation_count=1,

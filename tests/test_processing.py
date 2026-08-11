@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
@@ -11,21 +12,28 @@ from backend.app.bluetooth_sig import (
 )
 from backend.app.bluetooth_ad import parse_advertising_and_scan_response
 from backend.app.database import SQLITE_BUSY_TIMEOUT_SECONDS, SQLITE_POOL_SIZE, Base, engine_options
-from backend.app.device_intelligence import analyze_manufacturer_data, infer_device_category, short_uuid
+from backend.app.device_intelligence import (
+    FLIPPER_ZERO_GATT_SERIAL_SERVICE,
+    analyze_manufacturer_data,
+    classify_flipper_zero,
+    infer_device_category,
+    short_uuid,
+)
 from backend.app.models import DeviceEvent
 from backend.app.processing import (
     ProcessingSettings,
     ensure_utc,
     evaluate_presence_status,
-    identity_signature,
     infer_proximity_from_rssi,
     is_randomized_address,
     is_synthetic_address_pattern,
+    movement_result_from_metrics,
     normalize_hex,
     observed_again_status,
     proximity_band,
     rssi_window_metrics,
     signal_band_from_rssi,
+    signal_band_with_hysteresis,
     utcnow,
 )
 from backend.app.schemas import (
@@ -46,6 +54,25 @@ def test_rssi_signal_bands_do_not_claim_distance():
     assert signal_band_from_rssi(-82) == "signal_weak"
     assert signal_band_from_rssi(-94) == "signal_very_weak"
     assert proximity_band(None, -70) == "signal_moderate"
+
+
+def test_signal_band_hysteresis_holds_boundary_noise():
+    assert signal_band_with_hysteresis(-59, "signal_moderate") == "signal_moderate"
+    assert signal_band_with_hysteresis(-58, "signal_moderate") == "signal_strong"
+    assert signal_band_with_hysteresis(-76, "signal_moderate") == "signal_moderate"
+    assert signal_band_with_hysteresis(-78, "signal_moderate") == "signal_weak"
+    assert signal_band_with_hysteresis(-89, "signal_weak") == "signal_weak"
+    assert signal_band_with_hysteresis(-91, "signal_weak") == "signal_very_weak"
+
+
+def test_movement_metric_uses_separate_entry_and_exit_thresholds():
+    entering = rssi_window_metrics({"scanner-a": [-70] * 5 + [-69] * 5})
+    held = rssi_window_metrics({"scanner-a": [-70] * 5 + [-69.5] * 5})
+    exiting = rssi_window_metrics({"scanner-a": [-70] * 10})
+
+    assert movement_result_from_metrics(entering, "signal_stable").status == "probably_moving"
+    assert movement_result_from_metrics(held, "probably_moving").status == "probably_moving"
+    assert movement_result_from_metrics(exiting, "probably_moving").status == "signal_stable"
 
 
 def test_browser_location_diagnostic_contains_no_coordinate_fields():
@@ -262,7 +289,6 @@ def test_present_device_filter_excludes_missing_and_offline_history():
                     first_seen_at=now,
                     last_seen_at=now,
                     observation_count=1,
-                    identity_signature={},
                 )
             )
         db.commit()
@@ -293,7 +319,6 @@ def test_unresolved_random_address_expires_without_becoming_offline_device():
             first_seen_at=seen_at,
             last_seen_at=seen_at,
             observation_count=1,
-            identity_signature={},
         )
         stable = LogicalDevice(
             primary_address="24:11:11:b3:eb:ee",
@@ -304,7 +329,6 @@ def test_unresolved_random_address_expires_without_becoming_offline_device():
             first_seen_at=seen_at,
             last_seen_at=seen_at,
             observation_count=4,
-            identity_signature={},
         )
         confirmed_random = LogicalDevice(
             alias="Known phone",
@@ -316,7 +340,6 @@ def test_unresolved_random_address_expires_without_becoming_offline_device():
             first_seen_at=seen_at,
             last_seen_at=seen_at,
             observation_count=4,
-            identity_signature={},
         )
         db.add_all([unresolved, stable, confirmed_random])
         db.commit()
@@ -362,7 +385,6 @@ def test_overview_separates_present_ble_records_from_trackable_devices():
                     first_seen_at=now,
                     last_seen_at=now,
                     observation_count=4,
-                    identity_signature={},
                 ),
                 LogicalDevice(
                     primary_address="5b:ff:fa:8b:66:a4",
@@ -373,7 +395,6 @@ def test_overview_separates_present_ble_records_from_trackable_devices():
                     first_seen_at=now,
                     last_seen_at=now,
                     observation_count=1,
-                    identity_signature={},
                 ),
                 LogicalDevice(
                     primary_address="7a:11:22:33:44:55",
@@ -384,7 +405,6 @@ def test_overview_separates_present_ble_records_from_trackable_devices():
                     first_seen_at=now - timedelta(minutes=10),
                     last_seen_at=now - timedelta(minutes=10),
                     observation_count=1,
-                    identity_signature={},
                 ),
             ],
         )
@@ -598,19 +618,21 @@ def test_separated_raw_payload_is_canonical_source_for_ingestion():
         assert db.execute(select(func.count(Observation.id))).scalar_one() == 1
 
 
-def test_gatt_enrichment_is_directly_stored_and_preferred_for_display_name():
+def test_verified_flipper_advertisement_is_classified_in_list_and_detail_responses():
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    from backend.app.models import DeviceEnrichment, Scanner, ScannerConfiguration
+    from backend.app.models import Observation, Scanner, ScannerConfiguration
     from backend.app.services import device_detail, list_devices, process_batch
 
+    seen_at = utcnow()
+    raw_advertising_payload = "02010608094f6b696b69746703028230020a00"
     with TestSession() as db:
         scanner = Scanner(
-            id="scn_gatt",
-            display_name="GATT Scanner",
-            hardware_id="gatt-scanner-001",
+            id="scn_flipper_capture",
+            display_name="Flipper Capture Scanner",
+            hardware_id="flipper-capture-001",
             token_hash="hash",
             enabled=True,
         )
@@ -623,49 +645,64 @@ def test_gatt_enrichment_is_directly_stored_and_preferred_for_display_name():
             db,
             scanner,
             ObservationBatchIn(
-                batch_id="batch-gatt",
+                batch_id="batch-flipper-capture",
+                sent_at=seen_at,
+                scanner_time=seen_at,
+                time_source="usb_host_synchronized",
+                boot_id="boot-flipper-capture",
+                batch_sequence=1,
+                clock_sync_age_ms=10,
                 observations=[
                     {
-                        "observation_id": "obs-gatt",
-                        "address": "24:11:11:b3:eb:ee",
+                        "observation_id": "obs-flipper-capture",
+                        "observed_at": seen_at,
+                        "scanner_time": seen_at,
+                        "time_source": "usb_host_synchronized",
+                        "boot_id": "boot-flipper-capture",
+                        "monotonic_ms": 1234,
+                        "scan_cycle": 1,
+                        "clock_sync_age_ms": 10,
+                        "address": "80:e1:26:9e:3e:e3",
                         "address_type": "public",
-                        "advertised_name": "broadcast-name",
-                        "rssi": -60,
+                        "rssi": -72,
                         "advertising_type": "adv_ind",
                         "connectable": True,
-                        "gatt_enrichment": {
-                            "status": "success",
-                            "device_name": "Space Travel",
-                            "manufacturer_name": "MOONDROP",
-                            "model_number": "TWS-01",
-                            "firmware_revision": "1.2.3",
-                            "discovered_services": ["1800", "180a"],
-                            "characteristic_values": {
-                                "2a00": "53706163652054726176656c",
-                                "2a24": "5457532d3031",
-                            },
-                            "attempt_duration_ms": 412,
-                        },
+                        "raw_advertising_payload": raw_advertising_payload,
+                        "raw_scan_response_payload": "",
+                        "packet_length": 19,
+                        "advertising_packet_length": 19,
+                        "scan_response_packet_length": 0,
+                        "payload_layout_version": 2,
                     }
                 ],
             ),
         )
 
         assert result["accepted"] == 1
-        enrichment = db.execute(select(DeviceEnrichment)).scalar_one()
-        assert enrichment.device_name == "Space Travel"
-        assert enrichment.model_number == "TWS-01"
-        assert enrichment.details["directly_read"] is True
-        assert enrichment.details["pairing_forced"] is False
+        observation = db.execute(select(Observation)).scalar_one()
+        assert observation.processing_notes["device_classification"]["variant"] == "white"
 
         device = list_devices(db)[0]
-        assert device["display_name"] == "Space Travel"
-        assert device["display_name_source"] == "ble_gatt_device_name"
-        assert device["gatt_enrichment"]["manufacturer_name"] == "MOONDROP"
+        assert device["display_name"] == "Okikitg"
+        assert device["category"] == "flipper_zero"
+        assert device["device_classification"]["label"] == "Confirmed Flipper Zero"
+        assert device["device_classification"]["variant"] == "white"
 
         detail = device_detail(db, device["id"])
-        assert detail["device_enrichments"][0]["transport"] == "ble_gatt"
-        assert detail["recent_observations"][0]["gatt_enrichment"]["status"] == "success"
+        assert detail is not None
+        identity = detail["observed_identities"][0]
+        assert identity["device_classification"]["rule_id"] == "flipper_zero_official_ble_v1"
+
+
+def test_observation_schema_rejects_inline_gatt_enrichment():
+    with pytest.raises(ValidationError, match="gatt_enrichment"):
+        BLEObservationIn(
+            observation_id="obs-inline-gatt",
+            address="24:11:11:b3:eb:ee",
+            address_type="public",
+            rssi=-60,
+            gatt_enrichment={"status": "success", "device_name": "Space Travel"},
+        )
 
 
 def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_independent():
@@ -673,8 +710,8 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    from backend.app.models import DeviceEnrichment, Observation, Scanner, ScannerConfiguration
-    from backend.app.services import process_batch, record_gatt_enrichment
+    from backend.app.models import DeviceEnrichment, Observation, ProcessingError, Scanner, ScannerConfiguration
+    from backend.app.services import device_detail, list_devices, process_batch, record_gatt_enrichment
 
     with TestSession() as db:
         scanner = Scanner(
@@ -688,7 +725,7 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
         db.flush()
         db.add(ScannerConfiguration(scanner_id=scanner.id))
         db.commit()
-        process_batch(
+        batch_result = process_batch(
             db,
             scanner,
             ObservationBatchIn(
@@ -696,7 +733,7 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
                 observations=[
                     {
                         "observation_id": "obs-gatt-separate",
-                        "address": "24:11:11:b3:eb:ee",
+                        "address": "80:e1:26:9e:3e:e3",
                         "address_type": "public",
                         "advertised_name": "broadcast-name",
                         "rssi": -60,
@@ -709,7 +746,7 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
             report_id="gatt-obs-gatt-separate",
             source_observation_id="obs-gatt-separate",
             enriched_at=utcnow(),
-            address="24:11:11:b3:eb:ee",
+            address="80:e1:26:9e:3e:e3",
             address_type="public",
             gatt_enrichment={
                 "status": "success",
@@ -720,6 +757,8 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
             },
         )
 
+        processing_errors = db.execute(select(ProcessingError.message)).scalars().all()
+        assert batch_result["accepted"] == 1, processing_errors
         first = record_gatt_enrichment(db, scanner, report)
         duplicate = record_gatt_enrichment(db, scanner, report)
         observation = db.execute(select(Observation)).scalar_one()
@@ -729,8 +768,14 @@ def test_separate_gatt_enrichment_is_idempotent_and_keeps_raw_observation_indepe
         assert duplicate["duplicate"] is True
         assert enrichment.source_observation_id == observation.observation_id
         assert enrichment.details["reported_separately"] is True
-        assert observation.processing_notes["gatt_enrichment"] is None
+        assert "gatt_enrichment" not in observation.processing_notes
         assert observation.logical_device.display_name == "Space Travel"
+        device = list_devices(db)[0]
+        assert device["display_name_source"] == "ble_gatt_device_name"
+        assert device["gatt_enrichment"]["model_number"] == "TWS-01"
+        detail = device_detail(db, device["id"])
+        assert detail["device_enrichments"][0]["transport"] == "ble_gatt"
+        assert "gatt_enrichment" not in detail["recent_observations"][0]
 
 
 @pytest.mark.parametrize("status", ["operation_timeout", "cancelled"])
@@ -794,6 +839,179 @@ def test_live_processing_persists_paper_rssi_window_evidence():
         assert model["rssi_metric"] == 0.0
         assert model["signal_reliability"] == 1.0
         assert device["estimated_distance_m"] == pytest.approx(14.13, rel=1e-3)
+
+
+def test_repeated_signal_samples_keep_raw_history_without_duplicate_location_rows():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import DeviceLocationEstimate, Observation, Scanner, ScannerConfiguration
+    from backend.app.services import process_batch
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn-derived-history",
+            display_name="Derived History Scanner",
+            hardware_id="derived-history-001",
+            token_hash="hash",
+            status="online",
+            zone="Fixed zone",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+
+        for index in range(12):
+            result = process_batch(
+                db,
+                scanner,
+                ObservationBatchIn(
+                    batch_id=f"batch-derived-{index}",
+                    observations=[
+                        {
+                            "observation_id": f"observation-derived-{index}",
+                            "address": "10:20:30:40:50:61",
+                            "address_type": "public",
+                            "rssi": -70,
+                        }
+                    ],
+                ),
+            )
+            assert result["accepted"] == 1
+
+        assert db.execute(select(func.count(Observation.id))).scalar_one() == 12
+        assert db.execute(select(func.count(DeviceLocationEstimate.id))).scalar_one() == 1
+        event_types = set(db.execute(select(DeviceEvent.event_type)).scalars())
+        assert "device_location_estimate_changed" not in event_types
+        assert "device_signal_band_changed" not in event_types
+
+
+def test_movement_state_requires_dwell_and_does_not_toggle_per_packet():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.models import LogicalDevice, Scanner, ScannerConfiguration
+    from backend.app.services import process_batch
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn-movement-dwell",
+            display_name="Movement Dwell Scanner",
+            hardware_id="movement-dwell-001",
+            token_hash="hash",
+            status="online",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+
+        samples = [-70] * 11 + [-50] * 14
+        for index, rssi in enumerate(samples):
+            process_batch(
+                db,
+                scanner,
+                ObservationBatchIn(
+                    batch_id=f"batch-movement-dwell-{index}",
+                    observations=[
+                        {
+                            "observation_id": f"observation-movement-dwell-{index}",
+                            "address": "10:20:30:40:50:62",
+                            "address_type": "public",
+                            "rssi": rssi,
+                        }
+                    ],
+                ),
+            )
+
+        device = db.execute(select(LogicalDevice)).scalar_one()
+        movement_events = db.execute(
+            select(DeviceEvent)
+            .where(DeviceEvent.event_type == "device_movement_changed")
+            .order_by(DeviceEvent.occurred_at)
+        ).scalars().all()
+
+        assert device.movement_status == "signal_stable"
+        assert [event.new_state for event in movement_events] == [
+            "signal_stable",
+            "probably_moving",
+            "signal_stable",
+        ]
+        assert all(event.reason != "movement_transition_dwell_pending" for event in movement_events)
+
+
+def test_unresolved_random_identity_has_one_expiry_event_not_device_lifecycle_noise():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    from backend.app.config import Settings
+    from backend.app.models import LogicalDevice, Scanner, ScannerConfiguration
+    from backend.app.services import process_batch, refresh_presence_states
+
+    with TestSession() as db:
+        scanner = Scanner(
+            id="scn-random-expiry",
+            display_name="Random Expiry Scanner",
+            hardware_id="random-expiry-001",
+            token_hash="hash",
+            status="online",
+            enabled=True,
+        )
+        db.add(scanner)
+        db.flush()
+        db.add(ScannerConfiguration(scanner_id=scanner.id))
+        db.commit()
+
+        process_batch(
+            db,
+            scanner,
+            ObservationBatchIn(
+                batch_id="batch-random-expiry-first",
+                observations=[
+                    {
+                        "observation_id": "observation-random-expiry-first",
+                        "address": "5b:ff:fa:8b:66:a5",
+                        "address_type": "random",
+                        "rssi": -72,
+                    }
+                ],
+            ),
+        )
+        device = db.execute(select(LogicalDevice)).scalar_one()
+        assert db.execute(select(func.count(DeviceEvent.id))).scalar_one() == 0
+
+        device.last_seen_at = utcnow() - timedelta(minutes=1)
+        db.commit()
+        events = refresh_presence_states(
+            db,
+            Settings(presence_missing_seconds=5, presence_offline_seconds=30),
+        )
+        assert [event.event_type for event in events] == ["device_identity_expired"]
+
+        process_batch(
+            db,
+            scanner,
+            ObservationBatchIn(
+                batch_id="batch-random-expiry-return",
+                observations=[
+                    {
+                        "observation_id": "observation-random-expiry-return",
+                        "address": "5b:ff:fa:8b:66:a5",
+                        "address_type": "random",
+                        "rssi": -71,
+                    }
+                ],
+            ),
+        )
+        db.refresh(device)
+        assert device.status == "active"
+        assert db.execute(select(func.count(DeviceEvent.id))).scalar_one() == 1
 
 
 def test_latest_device_lookups_only_return_the_newest_row_per_device():
@@ -1042,6 +1260,58 @@ def test_device_category_inference_from_reference_patterns():
     assert infer_device_category("AirPods Pro", []) == "audio_headphones"
 
 
+def test_flipper_zero_classifier_requires_official_direct_evidence():
+    passive = classify_flipper_zero(
+        service_uuids=["00003082-0000-1000-8000-00805f9b34fb"],
+        capture_verified=True,
+        name="Okikitg",
+        address="80:e1:26:9e:3e:e3",
+        address_type="public",
+        tx_power=0,
+        advertising_type="adv_ind",
+        connectable=True,
+        advertising_flags={"general_discoverable_mode": True, "br_edr_not_supported": True},
+        observation_count=2566,
+    )
+
+    assert passive is not None
+    assert passive["label"] == "Confirmed Flipper Zero"
+    assert passive["variant"] == "white"
+    assert passive["profile"] == "serial_rpc"
+    assert passive["verification_scope"] == "passive_advertisement_fingerprint"
+    assert passive["spoofable"] is True
+    assert passive["evidence"][0] == {
+        "type": "official_serial_service_uuid",
+        "value": "0x3082",
+        "source": "verified_raw_advertising",
+    }
+
+    assert classify_flipper_zero(
+        service_uuids=["3082"],
+        capture_verified=False,
+        name="Flipper Test",
+        address="80:e1:26:00:00:01",
+        address_type="public",
+    ) is None
+    assert classify_flipper_zero(
+        service_uuids=["00001812-0000-1000-8000-00805f9b34fb"],
+        capture_verified=True,
+        name="Control Test",
+    ) is None
+
+
+def test_flipper_zero_classifier_accepts_official_gatt_identity_pair():
+    classification = classify_flipper_zero(
+        gatt_manufacturer_name="Flipper Devices Inc.",
+        gatt_services=[FLIPPER_ZERO_GATT_SERIAL_SERVICE],
+    )
+
+    assert classification is not None
+    assert classification["label"] == "Confirmed Flipper Zero"
+    assert classification["variant"] is None
+    assert classification["verification_scope"] == "active_gatt_fingerprint"
+
+
 def test_find_my_payload_detection():
     find_my_payload = "4c00" + "121910" + ("00" * 23) + "00"
     profile = analyze_manufacturer_data(find_my_payload)
@@ -1207,7 +1477,6 @@ def test_device_receives_scanner_coordinates_on_creation():
             first_seen_at=utcnow(),
             last_seen_at=utcnow(),
             observation_count=1,
-            identity_signature={},
         )
         db.add(device)
         db.commit()
@@ -1239,7 +1508,6 @@ def test_offline_device_keeps_last_coordinates():
             first_seen_at=utcnow(),
             last_seen_at=utcnow(),
             observation_count=5,
-            identity_signature={},
         )
         db.add(device)
         db.commit()
@@ -1408,14 +1676,13 @@ def test_same_device_moves_to_new_scanner_location_and_keeps_location_history():
             .where(DeviceLocationEstimate.logical_device_id == device.id)
             .order_by(DeviceLocationEstimate.estimated_at)
         ).scalars().all()
-        assert [estimate.scanner_id for estimate in estimates] == [scanner_a.id, scanner_a.id, scanner_b.id]
-        assert [estimate.zone for estimate in estimates] == ["Location A", "Location A", "Location B"]
+        assert [estimate.scanner_id for estimate in estimates] == [scanner_a.id, scanner_b.id]
+        assert [estimate.zone for estimate in estimates] == ["Location A", "Location B"]
 
         detail = device_detail(db, device.id)
         assert detail is not None
         assert [entry["scanner_id"] for entry in detail["location_history"]] == [
             scanner_b.id,
-            scanner_a.id,
             scanner_a.id,
         ]
 

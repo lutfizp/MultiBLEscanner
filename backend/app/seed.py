@@ -18,7 +18,6 @@ from .models import (
     DeviceTrackingSession,
     LogicalDevice,
     ManualDeviceCorrelationDecision,
-    MonitoredLocation,
     Observation,
     ObservedIdentity,
     ProcessingError,
@@ -45,19 +44,6 @@ def ensure_local_scanner() -> dict[str, object]:
     with SessionLocal() as db:
         ensure_default_settings(db)
 
-        location = db.execute(select(MonitoredLocation).where(MonitoredLocation.name == "Local USB Scanner")).scalar_one_or_none()
-        if location is None:
-            location = MonitoredLocation(
-                name="Local USB Scanner",
-                building=building,
-                floor=floor,
-                room=room,
-                zone=zone,
-                notes="Scanner connected to this computer by USB serial.",
-            )
-            db.add(location)
-            db.flush()
-
         scanner = db.get(Scanner, scanner_id)
         if scanner is None:
             scanner = Scanner(
@@ -66,11 +52,10 @@ def ensure_local_scanner() -> dict[str, object]:
                 hardware_id=hardware_id,
                 token_hash=hash_scanner_token(token, settings.scanner_token_salt),
                 installation_name=installation_name,
-                location_id=location.id,
-                building=location.building,
-                floor=location.floor,
-                room=location.room,
-                zone=location.zone,
+                building=building,
+                floor=floor,
+                room=room,
+                zone=zone,
                 latitude=None,
                 longitude=None,
                 status="registered",
@@ -84,7 +69,6 @@ def ensure_local_scanner() -> dict[str, object]:
             scanner.display_name = scanner_name
             scanner.hardware_id = hardware_id
             scanner.installation_name = installation_name
-            scanner.location_id = scanner.location_id or location.id
             if scanner.building in {None, "Development"}:
                 scanner.building = building
             if scanner.floor in {None, "1"}:
@@ -99,7 +83,7 @@ def ensure_local_scanner() -> dict[str, object]:
         return {
             "scanner_id": scanner.id,
             "scanner_token": token,
-            "location": location.name,
+            "location": zone,
             "note": "Local USB scanner token. Store it securely.",
         }
 

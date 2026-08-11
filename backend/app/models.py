@@ -23,24 +23,6 @@ def uuid_str() -> str:
     return str(uuid.uuid4())
 
 
-class MonitoredLocation(Base):
-    __tablename__ = "monitored_locations"
-
-    id = Column(String(36), primary_key=True, default=uuid_str)
-    name = Column(String(120), nullable=False)
-    building = Column(String(120))
-    floor = Column(String(80))
-    room = Column(String(120))
-    zone = Column(String(120))
-    latitude = Column(Float)
-    longitude = Column(Float)
-    indoor_x = Column(Float)
-    indoor_y = Column(Float)
-    notes = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
 class Scanner(Base):
     __tablename__ = "scanners"
 
@@ -49,7 +31,6 @@ class Scanner(Base):
     hardware_id = Column(String(160), nullable=False, unique=True)
     token_hash = Column(String(128), nullable=False)
     installation_name = Column(String(160))
-    location_id = Column(String(36), ForeignKey("monitored_locations.id"))
     building = Column(String(120))
     floor = Column(String(80))
     room = Column(String(120))
@@ -77,9 +58,6 @@ class Scanner(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    location = relationship("MonitoredLocation")
-
-
 class ScannerConfiguration(Base):
     __tablename__ = "scanner_configurations"
 
@@ -90,9 +68,6 @@ class ScannerConfiguration(Base):
     upload_interval_seconds = Column(Integer, nullable=False, default=5)
     batch_size = Column(Integer, nullable=False, default=40)
     rssi_min = Column(Integer, nullable=False, default=-110)
-    presence_missing_seconds = Column(Integer, nullable=False, default=45)
-    presence_offline_seconds = Column(Integer, nullable=False, default=180)
-    extra = Column(JSON, nullable=False, default=dict)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     scanner = relationship("Scanner")
@@ -138,14 +113,12 @@ class ObservedIdentity(Base):
     raw_advertising_payload = Column(Text)
     raw_scan_response_payload = Column(Text)
     randomized_address = Column(Boolean, nullable=False, default=False)
-    fingerprint = Column(String(128), nullable=False)
     first_seen_at = Column(DateTime(timezone=True), nullable=False)
     last_seen_at = Column(DateTime(timezone=True), nullable=False)
     observation_count = Column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         Index("ix_observed_identity_address", "address", "address_type"),
-        Index("ix_observed_identity_fingerprint", "fingerprint"),
     )
 
 
@@ -177,7 +150,6 @@ class LogicalDevice(Base):
     first_seen_at = Column(DateTime(timezone=True), nullable=False)
     last_seen_at = Column(DateTime(timezone=True), nullable=False)
     observation_count = Column(Integer, nullable=False, default=0)
-    identity_signature = Column(JSON, nullable=False, default=dict)
     notes = Column(Text)
     tags = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -432,6 +404,7 @@ class ManualDeviceCorrelationDecision(Base):
     source_logical_device_id = Column(String(36), ForeignKey("logical_devices.id"), nullable=False)
     target_logical_device_id = Column(String(36), ForeignKey("logical_devices.id"))
     observed_identity_id = Column(String(36), ForeignKey("observed_identities.id"))
+    correlation_id = Column(String(36), ForeignKey("device_identity_correlations.id"))
     reason = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

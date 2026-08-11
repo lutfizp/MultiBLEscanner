@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 APP_JS = Path(__file__).resolve().parents[1] / "dashboard" / "app.js"
+APP_CSS = Path(__file__).resolve().parents[1] / "dashboard" / "app.css"
 INDEX_HTML = Path(__file__).resolve().parents[1] / "dashboard" / "index.html"
 
 
@@ -163,3 +164,40 @@ def test_signal_finder_audio_uses_loud_df_style_loop_and_stale_mute():
     assert "context.createOscillator()" not in implementation
     assert "tracking.soundEnabled && !stale" in implementation
     assert "FINDER_TONE_MAX_GAIN * audibleLevel ** FINDER_TONE_GAIN_EXPONENT" in implementation
+
+
+def test_device_drawer_exposes_complete_operator_identity_workflow():
+    source = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="deviceMetadataForm"' in source
+    assert 'method: "PATCH"' in source
+    assert 'id="deviceMergeForm"' in source
+    assert 'action: "merge"' in source
+    assert 'data-split-identity=' in source
+    assert 'action: "split"' in source
+    assert 'data-review-correlation="accept_proposal"' in source
+    assert 'data-review-correlation="reject_proposal"' in source
+    assert "window.confirm(" in source
+    assert "correlation.successor_logical_device_id === device.id" in source
+
+
+def test_device_metadata_events_refresh_live_dashboard_state():
+    source = APP_JS.read_text(encoding="utf-8")
+    live_start = source.index("function connectLive")
+    live_end = source.index("\nfunction setLiveState", live_start)
+
+    assert '"device_metadata_updated"' in source[live_start:live_end]
+
+
+def test_flipper_zero_classification_is_visible_in_device_and_map_surfaces():
+    source = APP_JS.read_text(encoding="utf-8")
+    styles = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'classification?.product_class !== "flipper_zero"' in source
+    assert 'classification.label' in source
+    assert 'kv("Product identification"' in source
+    assert 'kv("Identification evidence"' in source
+    assert 'identity.device_classification' in source
+    assert 'device.device_classification?.label' in source
+    assert '<span class="map-device-classification">' in source
+    assert ".badge.product-confirmed" in styles

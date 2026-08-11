@@ -153,7 +153,6 @@ class BLEObservationIn(BaseModel):
     scan_response_packet_length: Optional[int] = Field(default=None, ge=0, le=255)
     payload_layout_version: Optional[int] = Field(default=None, ge=1, le=10)
     device_category: Optional[str] = Field(default=None, max_length=120)
-    gatt_enrichment: Optional[GATTEnrichmentIn] = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -334,9 +333,56 @@ class SettingsPatchIn(BaseModel):
     values: dict[str, Any]
 
 
+class DevicePatchIn(BaseModel):
+    alias: Optional[str] = Field(default=None, max_length=180)
+    notes: Optional[str] = Field(default=None, max_length=10_000)
+    tags: Optional[list[str]] = Field(default=None, max_length=50)
+    known: Optional[bool] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("alias", "notes")
+    @classmethod
+    def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_tags(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for item in value:
+            tag = item.strip()
+            if not tag:
+                continue
+            if len(tag) > 80:
+                raise ValueError("tags must be at most 80 characters")
+            if tag not in normalized:
+                normalized.append(tag)
+        return normalized
+
+
 class ManualCorrelationIn(BaseModel):
-    source_logical_device_id: str
-    target_logical_device_id: Optional[str] = None
-    observed_identity_id: Optional[str] = None
-    action: str = Field(pattern="^(merge|split|mark_known|mark_ignored|unignore)$")
-    reason: Optional[str] = None
+    source_logical_device_id: str = Field(min_length=1, max_length=36)
+    target_logical_device_id: Optional[str] = Field(default=None, max_length=36)
+    observed_identity_id: Optional[str] = Field(default=None, max_length=36)
+    correlation_id: Optional[str] = Field(default=None, max_length=36)
+    action: str = Field(
+        pattern="^(merge|split|mark_known|mark_ignored|unignore|accept_proposal|reject_proposal)$"
+    )
+    reason: Optional[str] = Field(default=None, max_length=2_000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_action_requirements(self) -> "ManualCorrelationIn":
+        if self.action == "merge" and not self.target_logical_device_id:
+            raise ValueError("target logical device required for merge")
+        if self.action == "split" and not self.observed_identity_id:
+            raise ValueError("observed identity required for split")
+        if self.action in {"accept_proposal", "reject_proposal"} and not self.correlation_id:
+            raise ValueError("correlation id required for proposal review")
+        return self
